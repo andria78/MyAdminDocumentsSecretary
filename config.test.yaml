@@ -1,0 +1,40 @@
+pipeline:
+  raw_scans_folder: "/Volumes/Public/-ScansImprimante"
+  searchable_pdf_folder: "/Volumes/Administratif/00-ScansNonTries"
+  destination_base_folder: "/Volumes/Administratif"
+
+  polling:
+    enabled: false
+
+  ocr:
+    engine: "tesseract"
+    languages: ["fra", "eng"]
+    dpi: 300
+    confidence_threshold: 0.7
+    output_format: "searchable_pdf"
+
+  ai:
+    engine: "ollama"
+    model: "qwen2.5:7b"
+    temperature: 0.1
+    max_tokens: 500
+    confidence_threshold: 0.7
+
+  duplicate_detection:
+    method: "sha256"
+    processed_index: "sqlite"
+
+  web_ui:
+    host: "127.0.0.1"
+    port: 8080
+    enabled: false
+
+  logging:
+    level: "DEBUG"
+    file: "logs/pipeline.test.log"
+    max_size_mb: 10
+    backup_count: 5
+
+  test_mode:
+    enabled: true
+    file_prefix: "__TEST__"
