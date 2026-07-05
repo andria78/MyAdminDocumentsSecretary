@@ -222,25 +222,30 @@ Return ONLY valid JSON:
 The pipeline renames files at each stage for clarity, while preserving traceability back to the original.
 
 **OCR Output Stage** — Searchable PDF in intermediate folder:
-- Original: `SCN_0042.pdf`
-- Renamed to: `{suggested_filename}.pdf` (e.g., `Facture_Orange_2024-03.pdf`)
+- If original filename starts with `rename_prefix` (e.g., `SCN_0042.pdf`):
+  → Renamed to: `{suggested_filename}.pdf` (e.g., `Facture_Orange_2024-03.pdf`)
+- If original filename does NOT start with `rename_prefix` (e.g., `Devis_2024_03.pdf`):
+  → Keeps original filename unchanged
 - The AI-suggested filename comes from the AI classification response
 
 **Final Destination Stage** — File in Person/Category folder:
-- Same name: `Facture_Orange_2024-03.pdf`
+- Same name as OCR Output Stage (either AI-suggested or original)
 - The original scanner filename is recorded in SQLite for traceability
 
 - **Input**: Searchable PDF (with original name) + AI classification result (with suggested_filename)
 - **Process**:
-  1. Generate new filename: `{ai_suggested_filename}.pdf`
-  2. Sanitize: replace spaces/special chars with underscores, limit length
-  3. Copy searchable PDF to intermediate folder with new name
-  4. Construct destination path: `/Volumes/Administratif/{Person}/{Category}/{ai_suggested_filename}.pdf`
-  5. Create directories if they don't exist
-  6. Copy to destination
-  7. **Verify** destination file exists and SHA-256 checksum matches
-  8. **Only then**: Delete the searchable PDF from intermediate folder
-  9. Update SQLite with original filename, suggested filename, paths, checksums
+  1. Check if original filename starts with `rename_prefix` (configurable, default `"SCN"`). In test mode, strip the test prefix before checking.
+  2. If yes → use AI-suggested filename: `{ai_suggested_filename}.pdf`
+  3. If no → keep original filename unchanged (the document already has a meaningful name)
+  4. If `rename_prefix` is empty string `""` → always rename with AI-suggested filename
+  5. Sanitize: replace spaces/special chars with underscores, limit length
+  6. Copy searchable PDF to intermediate folder with new name
+  7. Construct destination path: `/Volumes/Administratif/{Person}/{Category}/{filename}.pdf`
+  8. Create directories if they don't exist
+  9. Copy to destination
+  10. **Verify** destination file exists and SHA-256 checksum matches
+  11. **Only then**: Delete the searchable PDF from intermediate folder
+  12. Update SQLite with original filename, suggested/new filename, paths, checksums
 - **Safe deletion guarantee**: No file is ever deleted until the next stage's output is verified.
 
 #### Component 4: Safe Deletion Protocol (3-stage)
@@ -338,6 +343,8 @@ pipeline:
   searchable_pdf_folder: "/Volumes/Administratif/00-ScansNonTries"
   destination_base_folder: "/Volumes/Administratif"
 
+  rename_prefix: "SCN"                   # Only rename files starting with this prefix (e.g. SCN_0042.pdf). Empty string = rename all.
+
   polling:
     enabled: true
     interval_minutes: 15
@@ -380,6 +387,8 @@ pipeline:
   raw_scans_folder: "/Volumes/Public/-ScansImprimante"
   searchable_pdf_folder: "/Volumes/Administratif/00-ScansNonTries"
   destination_base_folder: "/Volumes/Administratif"
+
+  rename_prefix: "SCN"                   # Only rename files starting with this prefix (e.g. SCN_0042.pdf). Empty string = rename all.
 
   polling:
     enabled: false                    # Manual trigger only during testing
@@ -596,21 +605,33 @@ document-pipeline/
 - [ ] Install/configure Ollama with Qwen2.5 7B model
 - [ ] Design prompt template for person + category + suggested_filename extraction
 - [ ] Implement AI classification module (`src/ai_classifier.py`)
+- [ ] Implement `rename_prefix` logic: only rename files starting with the configured prefix (default `"SCN"`). Files NOT starting with this prefix keep their original name.
 - [ ] Implement filename sanitization (replace spaces/special chars with underscores, limit length)
 - [ ] Create `person_categories.yaml` with the hierarchy above
+- [ ] Create `tests/real_sources.yaml` — configuration file listing 10 real documents for testing
+- [ ] Implement `scripts/copy_real_test_data.py` — copies real documents with `__TEST_R__` prefix
 - [ ] Implement confidence threshold and low-confidence flagging
 - [ ] Extend `generate_test_data.py` to produce all 10 synthetic PDFs covering all 5 people
-- [ ] Test classification with diverse document types
+- [ ] Test classification with diverse document types (synthetic + real)
 - [ ] Verify AI-suggested filenames are meaningful and unique
 
-**Testing with test data (before going live):**
-1. Generate all 10 synthetic PDFs: `python scripts/generate_test_data.py --all`
+**Testing with test data — Step 1 (Synthetic):**
+1. Generate all 10 synthetic PDFs: `python scripts/generate_test_data.py`
 2. Copy all 10 to scanner folder: `cp tests/test_data/SYNTHETIC/*.pdf /Volumes/Public/-ScansImprimante/`
 3. Run pipeline: `python pipeline.py --config config.test.yaml --process`
 4. **Verify classification accuracy**: compare each document's AI output against the known ground truth table (Section 8 below). At minimum, 7 out of 10 should match the expected person.
 5. **Verify AI-suggested filenames** are sensible (e.g., dates present, document type in name)
-6. **Check SQLite database**: `python pipeline.py --status` — verify each document has correct person, category, and confidence score
-7. Run `bash scripts/cleanup_test_data.sh`
+6. Run `bash scripts/cleanup_test_data.sh`
+
+**Testing with test data — Step 2 (Real documents):**
+7. Configure `tests/real_sources.yaml` with paths to 10 real scanned documents (see Section 8 for selection criteria)
+8. Copy them with `__TEST_R__` prefix: `python scripts/copy_real_test_data.py`
+9. Run pipeline: `python pipeline.py --config config.test.yaml --process`
+10. Manually verify:
+    - All 10 real documents were OCR'd successfully
+    - AI classification results are sensible for each document
+    - Low-confidence documents (< 0.70) are noted for potential prompt refinement
+11. Run `bash scripts/cleanup_test_data.sh`
 
 ### Phase 3: Orchestration & File Management
 
@@ -627,7 +648,6 @@ document-pipeline/
 - [ ] Create CLI interface with all commands (`pipeline.py`)
 - [ ] Implement on-demand trigger via CLI
 - [ ] Implement status command showing full file lifecycle
-- [ ] Implement `scripts/copy_real_test_data.py` — copies 10 real documents with `__TEST_R__` prefix
 
 **Testing with test data (before going live):**
 1. **Duplicate test**: copy the same synthetic PDF twice to the scanner folder — second copy should be skipped
@@ -668,7 +688,7 @@ document-pipeline/
 5. Export the history as CSV — verify it contains all lifecycle fields
 6. Stop the web UI, run cleanup
 
-### Phase 5: Polish, Real Document Testing & Deployment
+### Phase 5: Polish, Optimization & Deployment
 
 **Implementation tasks:**
 - [ ] Add comprehensive logging and error handling
@@ -676,40 +696,30 @@ document-pipeline/
 - [ ] Performance testing on M5 Pro
 - [ ] Documentation and user guide
 - [ ] Final integration testing
+- [ ] Prompt refinement based on real document testing results from Phase 2
 
-**Pre-production validation (full dress rehearsal with hybrid data):**
+**Pre-production validation (final dress rehearsal):**
 
 **Step 1 — Synthetic documents (known ground truth):**
-1. Generate all 10 synthetic PDFs: `python scripts/generate_test_data.py --all`
+1. Generate all 10 synthetic PDFs: `python scripts/generate_test_data.py`
 2. Copy to scanner: `cp tests/test_data/SYNTHETIC/*.pdf /Volumes/Public/-ScansImprimante/`
 3. Run pipeline: `python pipeline.py --config config.test.yaml --process`
 4. Verify all 10 were processed, classified, and routed correctly
 5. Run cleanup: `bash scripts/cleanup_test_data.sh`
 
-**Step 2 — Real document copies (real-world OCR challenge):**
-6. Configure `tests/real_sources.yaml` with paths to 10 real scanned documents (see Section 8 for selection criteria)
+**Step 2 — Real document copies (re-run validation after Phase 4 Web UI):**
+6. Copy real documents with `__TEST_R__` prefix: `python scripts/copy_real_test_data.py`
+7. Run pipeline: `python pipeline.py --config config.test.yaml --process`
+8. Verify via the Web UI:
+   - All 10 real documents appear in History with full traceability
+   - AI classification results can be manually reviewed and overridden
+   - Low-confidence documents appear in the Review page
+9. Run cleanup: `bash scripts/cleanup_test_data.sh`
 
-7. Copy them with `__TEST_R__` prefix: `python scripts/copy_real_test_data.py`
-8. Run pipeline: `python pipeline.py --config config.test.yaml --process`
-9. Verify:
-   - All 10 real documents were OCR'd successfully (some may have lower OCR quality than synthetic — this is expected and realistic)
-   - AI classification results are sensible (manually review each one via the web UI)
-   - Any low-confidence documents appear in the Review page
-10. Run cleanup: `bash scripts/cleanup_test_data.sh`
-
-**Step 3 — Final validation:**
-11. Run `bash scripts/cleanup_test_data.sh` — confirm all `__TEST__` files removed from:
-   - `/Volumes/Public/-ScansImprimante/`
-   - `/Volumes/Administratif/00-ScansNonTries/`
-   - `/Volumes/Administratif/30-Eric/`
-   - `/Volumes/Administratif/40-Sophie/`
-   - `/Volumes/Administratif/50-Elisa/`
-   - `/Volumes/Administratif/60-Eva/`
-   - `/Volumes/Administratif/70-Loic/`
-   - `/Volumes/Administratif/20-Famille/`
-   - `data/pipeline.db` — confirm test entries are identifiable by `__TEST__` prefix in filenames
-12. Confirm no production documents were touched or modified
-13. **Switch to production**: Use `config.yaml` with real NAS paths and go live
+**Step 3 — Final safety sweep:**
+10. Run `bash scripts/cleanup_test_data.sh` — confirm all `__TEST__` files removed from all NAS folders and `data/pipeline.db`
+11. Confirm no production documents were touched or modified
+12. **Switch to production**: Use `config.yaml` with real NAS paths and go live
 
 ---
 
@@ -720,6 +730,7 @@ document-pipeline/
 | `raw_scans_folder` | `/Volumes/Public/-ScansImprimante` | Scanner output folder (SMB share) |
 | `searchable_pdf_folder` | `/Volumes/Administratif/00-ScansNonTries` | Intermediate inbox for processed PDFs |
 | `destination_base_folder` | `/Volumes/Administratif` | Root of Person/Category hierarchy |
+| `rename_prefix` | `"SCN"` | Only rename files starting with this prefix (e.g. `SCN_0042.pdf`). Set to empty string `""` to rename all files. |
 | `polling.interval_minutes` | 15 | Time between polls |
 | `ocr.languages` | `["fra", "eng"]` | Tesseract language codes |
 | `ocr.dpi` | 300 | Resolution for OCR |
@@ -746,20 +757,27 @@ document-pipeline/
 
 ### 8.2 Synthetic Documents (10 — Known Ground Truth)
 
-| # | Filename | Expected Person | Expected Category | Document Type | Language |
-|---|----------|----------------|-------------------|---------------|----------|
-| S01 | `__TEST_S01__Facture_Orange_2024-03.pdf` | Eric | 20-Achats&Fournisseurs | Internet invoice | French |
-| S02 | `__TEST_S02__Releve_Bancaire_Compte_Conjoint_2024-06.pdf` | Famille | 90-Financier | Bank statement | French |
-| S03 | `__TEST_S03__Bulletin_Salaire_Eric_Avril_2024.pdf` | Eric | 40-ActiviteProf | Pay slip | French |
-| S04 | `__TEST_S04__Passeport_Sophie_2025.pdf` | Sophie | 10-DocumentsOfficiels | Passport copy | French |
-| S05 | `__TEST_S05__Certificat_Scolarite_Elisa_2024-2025.pdf` | Elisa | 10-DocumentsOfficiels | School certificate | French |
-| S06 | `__TEST_S06__Contrat_Stage_Loic_Fev_2025.pdf` | Loic | 40-ActiviteProf | Internship agreement | French |
-| S07 | `__TEST_S07__Facture_Veolia_Eau_2024_Q3.pdf` | Famille | 20-Achats&Fournisseurs | Water bill | French |
-| S08 | `__TEST_S08__Ordonnance_Docteur_Eric_2025-01.pdf` | Eric | 80-Sante | Medical prescription | French |
-| S09 | `__TEST_S09__Invoice_Software_License_EN.pdf` | Eric | 70-Digital | Software license | English |
-| S10 | `__TEST_S10__Facture_Engie_Gaz_2024-12.pdf` | Famille | 20-Achats&Fournisseurs | Gas bill | French |
+The 10 synthetic documents are split into two groups to test the `rename_prefix` logic:
+
+- **Files starting with `SCN`** (stripped of `__TEST_Sxx__` prefix): these simulate scanner output and SHOULD be renamed by AI
+- **Files with descriptive names** (stripped of `__TEST_Sxx__` prefix): these simulate already-named documents and should KEEP their original name
+
+| # | Scanner Filename | Base Name (after test prefix) | Starts with `SCN`? | Renamed by AI? | Expected Person | Expected Category | Document Type |
+|---|-----------------|-------------------------------|-------------------|----------------|----------------|-------------------|---------------|
+| S01 | `__TEST_S01__SCN_0042.pdf` | `SCN_0042.pdf` | ✅ Yes | ✅ → `Facture_Orange_2024-03.pdf` | Eric | 20-Achats&Fournisseurs | Internet invoice |
+| S02 | `__TEST_S02__SCN_0043.pdf` | `SCN_0043.pdf` | ✅ Yes | ✅ → `Releve_Bancaire_Compte_Conjoint_2024-06.pdf` | Famille | 90-Financier | Bank statement |
+| S03 | `__TEST_S03__SCN_0044.pdf` | `SCN_0044.pdf` | ✅ Yes | ✅ → `Bulletin_Salaire_Eric_Avril_2024.pdf` | Eric | 40-ActiviteProf | Pay slip |
+| S04 | `__TEST_S04__Passeport_Sophie_2025.pdf` | `Passeport_Sophie_2025.pdf` | ❌ No | ❌ Keeps original name | Sophie | 10-DocumentsOfficiels | Passport copy |
+| S05 | `__TEST_S05__Certificat_Scolarite_Elisa_2024-2025.pdf` | `Certificat_Scolarite_Elisa_2024-2025.pdf` | ❌ No | ❌ Keeps original name | Elisa | 10-DocumentsOfficiels | School certificate |
+| S06 | `__TEST_S06__Contrat_Stage_Loic_Fev_2025.pdf` | `Contrat_Stage_Loic_Fev_2025.pdf` | ❌ No | ❌ Keeps original name | Loic | 40-ActiviteProf | Internship agreement |
+| S07 | `__TEST_S07__SCN_0047.pdf` | `SCN_0047.pdf` | ✅ Yes | ✅ → `Facture_Veolia_Eau_2024_Q3.pdf` | Famille | 20-Achats&Fournisseurs | Water bill |
+| S08 | `__TEST_S08__SCN_0048.pdf` | `SCN_0048.pdf` | ✅ Yes | ✅ → `Ordonnance_Docteur_Eric_2025-01.pdf` | Eric | 80-Sante | Medical prescription |
+| S09 | `__TEST_S09__Invoice_Software_License_EN.pdf` | `Invoice_Software_License_EN.pdf` | ❌ No | ❌ Keeps original name | Eric | 70-Digital | Software license |
+| S10 | `__TEST_S10__SCN_0050.pdf` | `SCN_0050.pdf` | ✅ Yes | ✅ → `Facture_Engie_Gaz_2024-12.pdf` | Famille | 20-Achats&Fournisseurs | Gas bill |
 
 **Coverage**: 5 different people (Eric x4, Famille x3, Sophie x1, Elisa x1, Loic x1), 6 different categories, mix of French and English
+
+**rename_prefix coverage**: 5 files starting with `SCN` (will be renamed by AI) + 5 files with descriptive names (will keep original name).
 
 > **Note**: Eva (prefix 60-) is not covered in synthetic test data. Consider adding a test document for Eva or including her in real document tests.
 
@@ -773,6 +791,7 @@ Suggested selection criteria for maximum test coverage:
 - 2 documents that are multi-page (tests OCR across pages)
 - 1 document that is mostly handwritten (tough OCR challenge)
 - 1 document that mixes French and English
+- **rename_prefix coverage**: Mix of `use_scn_prefix: true` and `false` entries (e.g., 5 SCN + 5 non-SCN) to test both rename paths
 
 **Example `tests/real_sources.yaml`** (you will fill this in):
 
@@ -780,21 +799,27 @@ Suggested selection criteria for maximum test coverage:
 # List of real documents to copy for testing
 # Source paths are on the NAS, destination is the scanner folder
 # Each file will be copied with __TEST_R__ prefix
+# use_scn_prefix: true  → copied as __TEST_R01__SCN_original.pdf (will be renamed by AI)
+# use_scn_prefix: false → copied as __TEST_R01__original.pdf (keeps original name)
 real_documents:
   - source: "/Volumes/Administratif/30-Eric/10-DocumentsOfficiels/Passport_2023.pdf"
     expected_person: "Eric"
     expected_category: "10-DocumentsOfficiels"
-    notes: "Clean passport scan"
+    use_scn_prefix: true
+    notes: "Clean passport scan — tests rename on SCN prefix"
   - source: "/Volumes/Administratif/40-Sophie/20-Achats&Fournisseurs/Amazon_commande_2024.pdf"
     expected_person: "Sophie"
     expected_category: "20-Achats&Fournisseurs"
-    notes: "Online order receipt"
-  # ... add 8 more real documents
+    use_scn_prefix: false
+    notes: "Online order receipt — tests no-rename on non-SCN name"
+  # ... add 8 more real documents (mix of use_scn_prefix: true/false)
 ```
 
 **How `copy_real_test_data.py` works:**
 1. Reads `tests/real_sources.yaml`
-2. For each entry, copies the source file to `/Volumes/Public/-ScansImprimante/__TEST_R01__{original_name}`
+2. For each entry:
+   - If `use_scn_prefix: true` → copies as `/Volumes/Public/-ScansImprimante/__TEST_R{NN:02d}__SCN_{original_name}`
+   - If `use_scn_prefix: false` (default) → copies as `/Volumes/Public/-ScansImprimante/__TEST_R{NN:02d}__{original_name}`
 3. Records the mapping in a JSON manifest (`tests/test_data/REAL/manifest.json`) for traceability
 4. Outputs a summary of what was copied
 
@@ -821,17 +846,28 @@ Each file is prefixed with `__TEST_S__` so it is:
 - Traceable through the pipeline lifecycle in the SQLite database
 - Has known ground truth for validating AI classification accuracy
 
+**Naming convention for rename_prefix testing:**
+- 5 files use `SCN`-style base names (after the `__TEST_Sxx__` prefix): `__TEST_S01__SCN_0042.pdf`, etc.
+  These simulate scanner output and trigger the AI renaming logic.
+- 5 files use descriptive base names (after the `__TEST_Sxx__` prefix): `__TEST_S04__Passeport_Sophie_2025.pdf`, etc.
+  These simulate already-named documents and should keep their original name.
+- The `rename_prefix` check operates on the **base name** (after stripping the test prefix in test mode).
+
 ### Real Document Copies (`copy_real_test_data.py`)
 
 `scripts/copy_real_test_data.py` copies real documents from their NAS locations:
 1. Reads the file `tests/real_sources.yaml` which lists 10 real document paths
-2. Copies each file to the scanner folder with `__TEST_R__` prefix
+2. For each entry, checks `use_scn_prefix`:
+   - `true` → copies as `__TEST_R{NN}__SCN_{original_name}` — tests SCN rename logic
+   - `false` (default) → copies as `__TEST_R{NN}__{original_name}` — tests no-rename behavior
 3. Records the source-to-copy mapping in a manifest
 
 Each copy is prefixed with `__TEST_R__` so it is:
 - Distinguishable from synthetic test data
 - Distinguishable from real production data
 - Safely batch-deletable by `cleanup_test_data.sh`
+
+**rename_prefix coverage for real documents**: Include a mix of `use_scn_prefix: true` and `false` entries to validate both rename and no-rename paths with real-world scanned documents.
 
 ### How Cleanup Works
 
