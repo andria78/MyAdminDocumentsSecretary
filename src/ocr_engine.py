@@ -118,6 +118,64 @@ class OCREngine:
             "error": None,
         }
 
+    def extract_text_direct(self, pdf_path: str) -> dict:
+        """
+        Extract text directly from an already-searchable PDF using PyMuPDF's
+        built-in text extraction. Does NOT run Tesseract OCR.
+
+        If the PDF has no text layer, falls back to running OCR via process_pdf()
+        so that even scanned PDFs placed in the searchable folder are handled.
+
+        Args:
+            pdf_path: Path to a searchable PDF file.
+
+        Returns:
+            dict with:
+                - success: bool
+                - text: str (extracted text from all pages)
+                - page_count: int
+                - error: str (if failed)
+        """
+        if not os.path.isfile(pdf_path):
+            return {
+                "success": False, "text": "", "page_count": 0,
+                "error": f"File not found: {pdf_path}",
+            }
+
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            return {
+                "success": False, "text": "", "page_count": 0,
+                "error": f"Failed to open PDF: {e}",
+            }
+
+        page_count = len(doc)
+        full_text_parts = []
+        for page_num in range(page_count):
+            page = doc[page_num]
+            text = page.get_text()  # Direct text extraction — no OCR needed
+            if text and text.strip():
+                full_text_parts.append(text.strip())
+
+        doc.close()
+
+        full_text = "\n\n".join(full_text_parts).strip()
+
+        # If no text was found via direct extraction, fall back to OCR
+        if not full_text:
+            logger.info(
+                "No text layer found in %s — falling back to OCR", pdf_path
+            )
+            return self.process_pdf(pdf_path, pdf_path)
+
+        return {
+            "success": True,
+            "text": full_text,
+            "page_count": page_count,
+            "error": None,
+        }
+
     def _extract_text_from_page(self, page: fitz.Page) -> str:
         """
         Render a PDF page as an image, run Tesseract OCR, and embed the

@@ -2,9 +2,12 @@
 """Document OCR Processing Pipeline — CLI Entry Point.
 
 Usage:
-    python pipeline.py --process                     # Process all new files
-    python pipeline.py --process --config <path>     # With custom config
-    python pipeline.py --help                        # Show help
+    python pipeline.py --process                          # Process raw scans
+    python pipeline.py --process --simulate               # Preview classification for raw scans
+    python pipeline.py --process-searchable                # Process files already in searchable folder
+    python pipeline.py --process-searchable --simulate     # Preview classification for searchable files
+    python pipeline.py --process --config <path>           # With custom config
+    python pipeline.py --help                              # Show help
 """
 
 import argparse
@@ -249,15 +252,149 @@ def route_to_destination(
     return True
 
 
-def process_all(config: ConfigManager) -> int:
+# ── Simulation helpers ─────────────────────────────────────────────────────
+
+
+def collect_simulation_row(
+    source: str,
+    filename: str,
+    classification: dict | None,
+    config: ConfigManager,
+) -> dict:
+    """
+    Collect a single row of simulation data without performing any file operations.
+
+    Args:
+        source: Full path to source file.
+        filename: Original filename.
+        classification: AI classification result dict (or None).
+        config: Pipeline configuration.
+
+    Returns:
+        dict with row data for the simulation table.
+    """
+    row: dict = {
+        "source_file": os.path.basename(source),
+        "source_path": source,
+        "person": "N/A",
+        "category": "N/A",
+        "suggested_filename": "N/A",
+        "confidence": None,
+        "destination_path": "N/A",
+        "subfolder": "N/A",
+        "status": "⚠️",
+    }
+
+    if classification and classification.get("success"):
+        person = classification["person"]
+        category = classification["category"]
+        suggested = classification["suggested_filename"]
+        confidence = classification["confidence"]
+
+        row["person"] = person
+        row["category"] = category
+        row["suggested_filename"] = suggested
+        row["confidence"] = confidence
+
+        # Determine final filename (same logic as in process_all)
+        effective_filename = filename
+        if config.test_mode_enabled:
+            effective_filename = strip_test_prefix(filename)
+
+        rename_prefix = config.rename_prefix
+        if rename_prefix:
+            if effective_filename.startswith(rename_prefix):
+                final_filename = f"{suggested}.pdf"
+            else:
+                final_filename = filename
+        else:
+            final_filename = f"{suggested}.pdf"
+
+        # Build destination path (in-memory only — no file operations)
+        dest_path = build_destination_path(config, person, category, final_filename)
+        row["destination_path"] = dest_path
+
+        if confidence >= config.ai_confidence_threshold:
+            row["status"] = "✅ Route"
+        else:
+            row["status"] = f"⬇️ LowConf ({confidence:.2f})"
+    else:
+        error = (
+            classification.get("error", "Unknown error")
+            if classification
+            else "No classification"
+        )
+        row["status"] = f"❌ {error[:50]}"
+
+    return row
+
+
+def print_simulation_table(results: list[dict]) -> None:
+    """
+    Print simulation results as a formatted table.
+    Uses Python's built-in string formatting (no external deps required).
+
+    Args:
+        results: List of dicts from collect_simulation_row().
+    """
+    if not results:
+        print("\n  No files to simulate.\n")
+        return
+
+    print()
+    print("=" * 130)
+    print("  SIMULATION RESULTS — Classification & Routing Preview")
+    print("=" * 130)
+
+    # Header row
+    header = f"{'#':<4} {'Source File':<36} {'Person':<12} {'Category':<28} {'Suggested Filename':<42} {'Confidence':<10} {'Status':<12}"
+    print(header)
+    print("-" * 130)
+
+    for i, row in enumerate(results, 1):
+        source = row.get("source_file", "")
+        person = row.get("person", "N/A")
+        category = row.get("category", "N/A")
+        suggested = row.get("suggested_filename", "N/A")
+        conf_val = row.get("confidence")
+        confidence = f"{conf_val:.2f}" if conf_val is not None else "N/A"
+        status = row.get("status", "⚠️")
+
+        # Truncate long strings for display
+        source_display = source if len(source) <= 35 else source[:32] + "..."
+        suggested_display = suggested if len(suggested) <= 41 else suggested[:38] + "..."
+
+        print(
+            f"{i:<4} {source_display:<36} {person:<12} {category:<28} "
+            f"{suggested_display:<42} {confidence:<10} {status:<12}"
+        )
+
+    print("-" * 130)
+    print(f"  Total: {len(results)} file(s) simulated")
+    print("=" * 130)
+
+    # Print full destination paths
+    print("\n  Full Destination Paths:")
+    for i, row in enumerate(results, 1):
+        dest = row.get("destination_path", "N/A")
+        print(f"  {i}. {dest}")
+    print()
+
+
+# ── Main processing functions ──────────────────────────────────────────────
+
+
+def process_all(config: ConfigManager, simulate: bool = False) -> int:
     """
     Process all new PDF files in the raw scans folder.
 
     Args:
         config: Pipeline configuration.
+        simulate: If True, run classification only and display results as a
+                  table without moving or deleting any files.
 
     Returns:
-        Number of files successfully processed.
+        Number of files successfully processed (or simulated).
     """
     logger = logging.getLogger("pipeline")
     raw_folder = config.raw_scans_folder
@@ -304,6 +441,7 @@ def process_all(config: ConfigManager) -> int:
     success_count = 0
     fail_count = 0
     skipped_count = 0
+    simulation_results: list[dict] = []
 
     for filename in sorted(pdf_files):
         input_path = os.path.join(raw_folder, filename)
@@ -408,7 +546,6 @@ def process_all(config: ConfigManager) -> int:
 
                 rename_prefix = config.rename_prefix
                 if rename_prefix:
-                    # Only rename if effective filename starts with rename_prefix
                     if effective_filename.startswith(rename_prefix):
                         final_filename = f"{suggested_filename}.pdf"
                         logger.info(
@@ -426,7 +563,6 @@ def process_all(config: ConfigManager) -> int:
                             effective_filename,
                         )
                 else:
-                    # Empty rename_prefix means rename ALL files
                     final_filename = f"{suggested_filename}.pdf"
                     logger.info(
                         "Filename renamed (rename_prefix=''): %s → %s",
@@ -463,6 +599,26 @@ def process_all(config: ConfigManager) -> int:
                     "No OCR text extracted for %s. File left in intermediate folder.",
                     filename,
                 )
+
+        # ── Simulation Mode (collect results, do NOT route) ────────────────
+        if simulate:
+            simulation_results.append(
+                collect_simulation_row(
+                    source=input_path,
+                    filename=filename,
+                    classification=classification,
+                    config=config,
+                )
+            )
+            logger.info(
+                "Simulation: %s → person=%s, category=%s, confidence=%s",
+                filename,
+                classification.get("person", "N/A") if classification else "N/A",
+                classification.get("category", "N/A") if classification else "N/A",
+                f"{classification.get('confidence', 0.0):.2f}" if classification else "N/A",
+            )
+            success_count += 1
+            continue
 
         # ── Phase 2: File Routing ───────────────────────────────────────────
         if should_route and classification:
@@ -508,7 +664,6 @@ def process_all(config: ConfigManager) -> int:
                         output_path,
                         e,
                     )
-                    # Non-fatal — destination copy exists
 
                 # Safe deletion: delete raw scan from scanner folder
                 try:
@@ -518,7 +673,6 @@ def process_all(config: ConfigManager) -> int:
                     logger.error(
                         "Failed to delete raw scan %s: %s", filename, e
                     )
-                    # Non-fatal — destination copy exists
 
                 logger.info(
                     "Successfully processed and routed %s → %s/%s/%s",
@@ -533,7 +687,6 @@ def process_all(config: ConfigManager) -> int:
                     "Routing failed for %s. File preserved in intermediate folder.",
                     filename,
                 )
-                # Do NOT delete raw scan — file needs attention
                 fail_count += 1
         else:
             # File not routed — leave in intermediate folder
@@ -555,6 +708,10 @@ def process_all(config: ConfigManager) -> int:
             )
             skipped_count += 1
 
+    # ── Print simulation table if in simulation mode ──────────────────────
+    if simulate and simulation_results:
+        print_simulation_table(simulation_results)
+
     logger.info(
         "Processing cycle complete: %d succeeded, %d failed, %d skipped (not routed) out of %d",
         success_count,
@@ -566,6 +723,291 @@ def process_all(config: ConfigManager) -> int:
     return success_count
 
 
+def process_searchable(config: ConfigManager, simulate: bool = False) -> int:
+    """
+    Process PDF files already in the searchable PDF folder.
+
+    These files are already digital/searchable, so they skip the full OCR step
+    and go directly to AI classification + routing. If a file has no text layer,
+    OCR is run as a fallback.
+
+    Args:
+        config: Pipeline configuration.
+        simulate: If True, run classification only and display results as a
+                  table without moving or deleting any files.
+
+    Returns:
+        Number of files successfully processed (or simulated).
+    """
+    logger = logging.getLogger("pipeline")
+    folder = config.searchable_pdf_folder
+
+    logger.info("Starting searchable-folder processing cycle")
+    logger.info("Searchable PDF folder: %s", folder)
+
+    if not os.path.isdir(folder):
+        logger.error("Searchable PDF folder does not exist: %s", folder)
+        return 0
+
+    # Collect PDF files
+    pdf_files = [
+        f for f in os.listdir(folder)
+        if f.lower().endswith(".pdf")
+        and os.path.isfile(os.path.join(folder, f))
+    ]
+
+    if not pdf_files:
+        logger.info("No PDF files found in %s", folder)
+        return 0
+
+    logger.info("Found %d PDF file(s) in searchable folder", len(pdf_files))
+
+    # Initialize OCR engine (needed for text extraction + OCR fallback)
+    ocr_engine = OCREngine(config)
+
+    # Initialize AI classifier (graceful if Ollama is not available)
+    ai_classifier = None
+    try:
+        ai_classifier = AIClassifier(config)
+        logger.info("AI classifier initialized (model: %s)", config.ai_model)
+    except Exception as e:
+        logger.warning(
+            "Failed to initialize AI classifier: %s. "
+            "Searchable files cannot be classified.",
+            e,
+        )
+        return 0
+
+    success_count = 0
+    fail_count = 0
+    simulation_results: list[dict] = []
+
+    for filename in sorted(pdf_files):
+        filepath = os.path.join(folder, filename)
+        logger.info("Processing: %s", filename)
+
+        # ── Step 1: Direct text extraction (fast path) ────────────────────
+        # extract_text_direct tries PyMuPDF's get_text() first.
+        # If no text layer exists, it falls back to OCR automatically.
+        result = ocr_engine.extract_text_direct(filepath)
+        if not result["success"]:
+            logger.error(
+                "Text extraction failed for %s: %s", filename, result["error"]
+            )
+            fail_count += 1
+            continue
+
+        ocr_text = result.get("text", "")
+        page_count = result.get("page_count", 0)
+        logger.info(
+            "Text extracted: %d pages, %d chars", page_count, len(ocr_text)
+        )
+
+        # ── Step 2: AI Classification ─────────────────────────────────────
+        classification = None
+        should_route = False
+
+        if ai_classifier is not None and ocr_text:
+            try:
+                classification = ai_classifier.classify(
+                    ocr_text=ocr_text,
+                    filename=filename,
+                    page_count=page_count,
+                )
+            except Exception as e:
+                logger.error(
+                    "AI classification failed for %s: %s. "
+                    "File left in searchable folder.",
+                    filename,
+                    e,
+                )
+                classification = {"success": False, "error": str(e)}
+
+            if classification.get("success"):
+                person = classification["person"]
+                category = classification["category"]
+                confidence = classification["confidence"]
+                suggested_filename = classification["suggested_filename"]
+
+                logger.info(
+                    "AI classification: person=%s, category=%s, "
+                    "confidence=%.2f, suggested=%s",
+                    person,
+                    category,
+                    confidence,
+                    suggested_filename,
+                )
+                logger.debug(
+                    "AI reasoning: %s", classification.get("reasoning", "")
+                )
+
+                # Determine final filename
+                effective_filename = filename
+                if config.test_mode_enabled:
+                    effective_filename = strip_test_prefix(filename)
+
+                rename_prefix = config.rename_prefix
+                if rename_prefix:
+                    if effective_filename.startswith(rename_prefix):
+                        final_filename = f"{suggested_filename}.pdf"
+                        logger.info(
+                            "Filename renamed: %s → %s (prefix '%s' matched)",
+                            filename,
+                            final_filename,
+                            rename_prefix,
+                        )
+                    else:
+                        final_filename = filename
+                        logger.info(
+                            "Filename kept: %s (prefix '%s' not matched on '%s')",
+                            filename,
+                            rename_prefix,
+                            effective_filename,
+                        )
+                else:
+                    final_filename = f"{suggested_filename}.pdf"
+                    logger.info(
+                        "Filename renamed (rename_prefix=''): %s → %s",
+                        filename,
+                        final_filename,
+                    )
+
+                if confidence >= config.ai_confidence_threshold:
+                    should_route = True
+                else:
+                    logger.warning(
+                        "Confidence %.2f below threshold %.2f for %s. "
+                        "File left in searchable folder for review.",
+                        confidence,
+                        config.ai_confidence_threshold,
+                        filename,
+                    )
+            else:
+                logger.warning(
+                    "AI classification failed for %s: %s. "
+                    "File left in searchable folder for review.",
+                    filename,
+                    classification.get("error", "Unknown error"),
+                )
+        else:
+            if ai_classifier is None:
+                logger.warning(
+                    "AI classifier not available. File left in searchable folder: %s",
+                    filename,
+                )
+            elif not ocr_text:
+                logger.warning(
+                    "No text extracted for %s. File left in searchable folder.",
+                    filename,
+                )
+
+        # ── Simulation Mode (collect results, do NOT route) ────────────────
+        if simulate:
+            simulation_results.append(
+                collect_simulation_row(
+                    source=filepath,
+                    filename=filename,
+                    classification=classification,
+                    config=config,
+                )
+            )
+            logger.info(
+                "Simulation: %s → person=%s, category=%s, confidence=%s",
+                filename,
+                classification.get("person", "N/A") if classification else "N/A",
+                classification.get("category", "N/A") if classification else "N/A",
+                f"{classification.get('confidence', 0.0):.2f}" if classification else "N/A",
+            )
+            success_count += 1
+            continue
+
+        # ── Step 3: File Routing ──────────────────────────────────────────
+        if should_route and classification:
+            person = classification["person"]
+            category = classification["category"]
+            suggested_filename = classification["suggested_filename"]
+
+            # Determine final filename (same logic as above)
+            effective_filename = filename
+            if config.test_mode_enabled:
+                effective_filename = strip_test_prefix(filename)
+
+            rename_prefix = config.rename_prefix
+            if rename_prefix:
+                if effective_filename.startswith(rename_prefix):
+                    final_filename = f"{suggested_filename}.pdf"
+                else:
+                    final_filename = filename
+            else:
+                final_filename = f"{suggested_filename}.pdf"
+
+            # Route to destination
+            dest_base = config.destination_base_folder
+            routing_ok = route_to_destination(
+                source_path=filepath,
+                dest_base=dest_base,
+                person=person,
+                category=category,
+                filename=final_filename,
+                config=config,
+                ai_classifier=ai_classifier,
+                ocr_text=ocr_text,
+            )
+
+            if routing_ok:
+                # Safe deletion: delete file from searchable folder
+                try:
+                    os.remove(filepath)
+                    logger.info("Deleted from searchable folder: %s", filename)
+                except Exception as e:
+                    logger.error(
+                        "Failed to delete %s from searchable folder: %s",
+                        filename,
+                        e,
+                    )
+
+                logger.info(
+                    "Successfully processed and routed %s → %s/%s/%s",
+                    filename,
+                    person,
+                    category,
+                    final_filename,
+                )
+                success_count += 1
+            else:
+                logger.error(
+                    "Routing failed for %s. File preserved in searchable folder.",
+                    filename,
+                )
+                fail_count += 1
+        else:
+            logger.info(
+                "Text extracted for %s (%d pages, %d chars). "
+                "File left in searchable folder (not routed).",
+                filename,
+                page_count,
+                len(ocr_text),
+            )
+            fail_count += 1
+
+    # ── Print simulation table if in simulation mode ──────────────────────
+    if simulate and simulation_results:
+        print_simulation_table(simulation_results)
+
+    logger.info(
+        "Searchable-folder processing cycle complete: "
+        "%d succeeded, %d failed out of %d",
+        success_count,
+        fail_count,
+        len(pdf_files),
+    )
+
+    return success_count
+
+
+# ── CLI entry point ────────────────────────────────────────────────────────
+
+
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -573,8 +1015,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python pipeline.py --process                     Process all new files\n"
-            "  python pipeline.py --process --config test.yaml  Use custom config\n"
+            "  python pipeline.py --process                          "
+            "Process raw scans\n"
+            "  python pipeline.py --process --config test.yaml       "
+            "Use custom config\n"
+            "  python pipeline.py --process --simulate               "
+            "Preview classification\n"
+            "  python pipeline.py --process-searchable                "
+            "Process searchable folder\n"
+            "  python pipeline.py --process-searchable --simulate     "
+            "Preview searchable folder\n"
         ),
     )
 
@@ -582,6 +1032,22 @@ def main():
         "--process",
         action="store_true",
         help="Process all new PDF files in the raw scans folder",
+    )
+    parser.add_argument(
+        "--process-searchable",
+        action="store_true",
+        help=(
+            "Process PDF files already in the searchable folder "
+            "(skip OCR, go direct to AI classification)"
+        ),
+    )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help=(
+            "Run in simulation mode: show classification results as a table "
+            "without moving or deleting any files"
+        ),
     )
     parser.add_argument(
         "--config",
@@ -592,7 +1058,7 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.process:
+    if not args.process and not args.process_searchable:
         parser.print_help()
         sys.exit(0)
 
@@ -609,8 +1075,15 @@ def main():
     logger = logging.getLogger("pipeline")
     logger.info("Pipeline started with config: %s", args.config)
 
+    if args.simulate:
+        logger.info("SIMULATION MODE — no files will be moved or deleted")
+
     # Process files
-    processed = process_all(config)
+    processed = 0
+    if args.process_searchable:
+        processed = process_searchable(config, simulate=args.simulate)
+    elif args.process:
+        processed = process_all(config, simulate=args.simulate)
 
     if processed == 0:
         logger.info("No files were processed.")
