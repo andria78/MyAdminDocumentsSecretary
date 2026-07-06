@@ -2,6 +2,8 @@ pipeline:
   raw_scans_folder: "/Volumes/Public/-ScansImprimante"
   searchable_pdf_folder: "/Volumes/Administratif/00-ScansNonTries"
   destination_base_folder: "/Volumes/Administratif"
+  person_categories_path: "person_categories.yaml"
+  rename_prefix: "SCN"
 
   polling:
     enabled: false
@@ -19,6 +21,10 @@ pipeline:
     temperature: 0.1
     max_tokens: 500
     confidence_threshold: 0.7
+
+  routing:
+    enable_subfolder_detection: true
+    subfolder_confidence_threshold: 0.5
 
   duplicate_detection:
     method: "sha256"

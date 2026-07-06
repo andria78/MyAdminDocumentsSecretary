@@ -1,0 +1,82 @@
+# Real document sources for testing the AI classifier and pipeline
+#
+# Source paths are on the NAS, destination is the scanner folder.
+# Each file will be copied with __TEST_R__ prefix.
+#
+# use_scn_prefix: true  → copied as __TEST_R01__SCN_{original_name} (will be renamed by AI)
+# use_scn_prefix: false → copied as __TEST_R01__{original_name} (keeps original name)
+#
+# Selection criteria:
+# - 3 documents from different people (Eric, Sophie, Famille, etc.)
+# - 3 documents with different quality levels (clean, slightly skewed, low contrast)
+# - 2 multi-page documents (tests OCR across pages)
+# - 1 document that is mostly handwritten (tough OCR challenge)
+# - 1 document mixing French and English
+# - Mix of use_scn_prefix: true and false (5 SCN + 5 non-SCN)
+
+real_documents:
+  # ── Eric (3 documents) ──────────────────────────────────────────────
+  - source: "/Volumes/Administratif/30-Eric/10-DocumentsOfficiels/Passport_2023.pdf"
+    expected_person: "Eric"
+    expected_category: "10-DocumentsOfficiels"
+    use_scn_prefix: true
+    notes: "Clean passport scan — tests rename on SCN prefix, single page"
+
+  - source: "/Volumes/Administratif/30-Eric/40-ActiviteProf/Bulletin_Salaire_2024_12.pdf"
+    expected_person: "Eric"
+    expected_category: "40-ActiviteProf"
+    use_scn_prefix: false
+    notes: "Pay slip — tests no-rename on non-SCN name, single page"
+
+  - source: "/Volumes/Administratif/30-Eric/80-Sante/Ordonnance_2025_03.pdf"
+    expected_person: "Eric"
+    expected_category: "80-Sante"
+    use_scn_prefix: true
+    notes: "Medical prescription — mostly handwritten, tough OCR challenge"
+
+  # ── Sophie (2 documents) ────────────────────────────────────────────
+  - source: "/Volumes/Administratif/40-Sophie/20-Achats&Fournisseurs/Amazon_commande_2024.pdf"
+    expected_person: "Sophie"
+    expected_category: "20-Achats&Fournisseurs"
+    use_scn_prefix: false
+    notes: "Online order receipt — tests no-rename, single page"
+
+  - source: "/Volumes/Administratif/40-Sophie/10-DocumentsOfficiels/Acte_Naissance.pdf"
+    expected_person: "Sophie"
+    expected_category: "10-DocumentsOfficiels"
+    use_scn_prefix: true
+    notes: "Birth certificate — multi-page document, official format"
+
+  # ── Famille (2 documents) ───────────────────────────────────────────
+  - source: "/Volumes/Administratif/20-Famille/90-Financier/Releve_Bancaire_2024_12.pdf"
+    expected_person: "Famille"
+    expected_category: "90-Financier"
+    use_scn_prefix: false
+    notes: "Bank statement — multi-page document, tests OCR across pages"
+
+  - source: "/Volumes/Administratif/20-Famille/20-Achats&Fournisseurs/Facture_Eau_2024_Q4.pdf"
+    expected_person: "Famille"
+    expected_category: "20-Achats&Fournisseurs"
+    use_scn_prefix: true
+    notes: "Water bill — tests sub-folder routing (FournisseursEnergie if exists)"
+
+  # ── Elisa (1 document) ──────────────────────────────────────────────
+  - source: "/Volumes/Administratif/50-Elisa/10-DocumentsOfficiels/Certificat_Scolarite_2024_2025.pdf"
+    expected_person: "Elisa"
+    expected_category: "10-DocumentsOfficiels"
+    use_scn_prefix: false
+    notes: "School certificate — tests classification for Elisa"
+
+  # ── Eva (1 document) ────────────────────────────────────────────────
+  - source: "/Volumes/Administratif/60-Eva/10-DocumentsOfficiels/Passeport_2024.pdf"
+    expected_person: "Eva"
+    expected_category: "10-DocumentsOfficiels"
+    use_scn_prefix: true
+    notes: "Eva's passport — covers Eva (prefix 60-) not in synthetic tests"
+
+  # ── Loic (1 document) ───────────────────────────────────────────────
+  - source: "/Volumes/Administratif/70-Loic/40-ActiviteProf/Convention_Stage_2025.pdf"
+    expected_person: "Loic"
+    expected_category: "40-ActiviteProf"
+    use_scn_prefix: false
+    notes: "Internship agreement — tests classification for Loic, may mix French/English"
