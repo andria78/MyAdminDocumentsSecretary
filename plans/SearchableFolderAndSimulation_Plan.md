@@ -22,24 +22,19 @@ searchable_pdf_folder (00-ScansNonTries/)
     │
     ▼
 [Direct text extraction via PyMuPDF page.get_text()]
-    │  (no Tesseract OCR — files are already searchable)
-    ▼
-[AI Classification]  (same as current pipeline)
     │
-    ▼
-[Routing to destination]  (same as current pipeline)
+    ├── Text found ──► [AI Classification] ──► [Routing] ──► [Delete source]
     │
-    ▼
-[Delete from searchable folder on success]
+    └── No text ──► [Fallback to OCR via process_pdf()] ──► [AI Classification] ──► [Routing] ──► [Delete source]
 ```
 
 ### Implementation
 
-#### A. Add `extract_text_from_pdf()` to `OCREngine` (or a static utility)
+#### A. Add `extract_text_direct()` to `OCREngine`
 
-Rather than re-running the full OCR pipeline (render → Tesseract → embed), use PyMuPDF's built-in `page.get_text()` to extract the existing text layer directly. This is orders of magnitude faster.
+Rather than re-running the full OCR pipeline (render → Tesseract → embed), use PyMuPDF's built-in `page.get_text()` to extract the existing text layer directly. This is orders of magnitude faster. If no text layer is found, it falls back to full OCR via `process_pdf()`.
 
-**New method in [`src/ocr_engine.py`](/src/ocr_engine.py) — around line 38:**
+**New method in [`src/ocr_engine.py`](/src/ocr_engine.py) — around line 121:**
 
 ```python
 def extract_text_direct(self, pdf_path: str) -> dict:
@@ -101,7 +96,7 @@ This mirrors `process_all()` but:
 - Goes straight to AI classification + routing
 - Deletes source file from searchable folder on successful routing
 
-**New function — around line 252:**
+**New function — around line 726:**
 
 ```python
 def process_searchable(config: ConfigManager, simulate: bool = False) -> int:
@@ -219,7 +214,7 @@ def process_searchable(config: ConfigManager, simulate: bool = False) -> int:
     return success_count
 ```
 
-#### C. New CLI flags in `main()` — around line 569
+#### C. New CLI flags in `main()` — around line 995
 
 Add two new arguments:
 
@@ -237,16 +232,16 @@ parser.add_argument(
 )
 ```
 
-And the execution logic:
+And the actual execution logic (single log message, then dispatch):
 
 ```python
+if args.simulate:
+    logger.info("SIMULATION MODE — no files will be moved or deleted")
+
+processed = 0
 if args.process_searchable:
-    if args.simulate:
-        logger.info("SIMULATION MODE — no files will be moved or deleted")
     processed = process_searchable(config, simulate=args.simulate)
 elif args.process:
-    if args.simulate:
-        logger.info("SIMULATION MODE — no files will be moved or deleted")
     processed = process_all(config, simulate=args.simulate)
 ```
 
@@ -287,7 +282,7 @@ Reuse the existing `build_destination_path()` function and just collect the path
 
 #### C. Simulation table display
 
-Use Python's built-in `tabulate` package (add to requirements.txt) or the `rich` library, or simply format with Python string formatting.
+Uses Python's built-in string formatting (no external dependencies required).
 
 **Table columns:**
 
@@ -295,47 +290,54 @@ Use Python's built-in `tabulate` package (add to requirements.txt) or the `rich`
 |---|------------|--------|----------|-------------------|-----------|-----------------|-----------|--------|
 | 1 | SCN_0042.pdf | Eric | 20-Achats&Fournisseurs | Facture_Orange_2024-03 | 0.95 | /Volumes/.../30-Eric/20-Achats.../Facture_Orange_2024-03.pdf | top-level | ✅ Route |
 
-**Implementation in [`pipeline.py`](/pipeline.py) — new function:**
+**Implementation in [`pipeline.py`](/pipeline.py) — around line 332:**
 
 ```python
 def print_simulation_table(results: list[dict]) -> None:
     """
     Print simulation results as a formatted table.
     Uses Python's built-in string formatting (no external deps required).
+
+    Args:
+        results: List of dicts from collect_simulation_row().
     """
     if not results:
-        print("\nNo files to simulate.")
+        print("\n  No files to simulate.\n")
         return
 
-    print("\n" + "=" * 120)
+    print()
+    print("=" * 130)
     print("  SIMULATION RESULTS — Classification & Routing Preview")
-    print("=" * 120)
+    print("=" * 130)
 
-    # Header
-    print(f"{'#':<4} {'Source File':<35} {'Person':<12} {'Category':<28} "
-          f"{'Suggested Filename':<40} {'Confidence':<10} {'Status':<10}")
-    print("-" * 120)
+    # Header row
+    header = f"{'#':<4} {'Source File':<36} {'Person':<12} {'Category':<28} {'Suggested Filename':<42} {'Confidence':<10} {'Status':<12}"
+    print(header)
+    print("-" * 130)
 
     for i, row in enumerate(results, 1):
         source = row.get("source_file", "")
         person = row.get("person", "N/A")
         category = row.get("category", "N/A")
         suggested = row.get("suggested_filename", "N/A")
-        confidence = f"{row.get('confidence', 0.0):.2f}" if row.get("confidence") else "N/A"
+        conf_val = row.get("confidence")
+        confidence = f"{conf_val:.2f}" if conf_val is not None else "N/A"
         status = row.get("status", "⚠️")
 
-        # Truncate long strings
-        source = source[:34] if len(source) > 34 else source
-        suggested = suggested[:39] if len(suggested) > 39 else suggested
+        # Truncate long strings for display
+        source_display = source if len(source) <= 35 else source[:32] + "..."
+        suggested_display = suggested if len(suggested) <= 41 else suggested[:38] + "..."
 
-        print(f"{i:<4} {source:<35} {person:<12} {category:<28} "
-              f"{suggested:<40} {confidence:<10} {status:<10}")
+        print(
+            f"{i:<4} {source_display:<36} {person:<12} {category:<28} "
+            f"{suggested_display:<42} {confidence:<10} {status:<12}"
+        )
 
-    print("-" * 120)
-    print(f"Total: {len(results)} file(s) simulated")
-    print("=" * 120)
+    print("-" * 130)
+    print(f"  Total: {len(results)} file(s) simulated")
+    print("=" * 130)
 
-    # Optionally print full destination paths
+    # Print full destination paths
     print("\n  Full Destination Paths:")
     for i, row in enumerate(results, 1):
         dest = row.get("destination_path", "N/A")
@@ -364,7 +366,7 @@ def collect_simulation_row(
     Returns:
         dict with row data for the simulation table.
     """
-    row = {
+    row: dict = {
         "source_file": os.path.basename(source),
         "source_path": source,
         "person": "N/A",
@@ -387,21 +389,22 @@ def collect_simulation_row(
         row["suggested_filename"] = suggested
         row["confidence"] = confidence
 
-        # Build destination path (in-memory only)
-        # Determine final filename
+        # Determine final filename (same logic as in process_all)
         effective_filename = filename
+        if config.test_mode_enabled:
+            effective_filename = strip_test_prefix(filename)
+
         rename_prefix = config.rename_prefix
-        if rename_prefix and effective_filename.startswith(rename_prefix):
-            final_filename = f"{suggested}.pdf"
-        elif not rename_prefix:
-            final_filename = f"{suggested}.pdf"
+        if rename_prefix:
+            if effective_filename.startswith(rename_prefix):
+                final_filename = f"{suggested}.pdf"
+            else:
+                final_filename = filename
         else:
-            final_filename = filename
+            final_filename = f"{suggested}.pdf"
 
-        dest_path = build_destination_path(
-            config, person, category, final_filename
-        )
-
+        # Build destination path (in-memory only — no file operations)
+        dest_path = build_destination_path(config, person, category, final_filename)
         row["destination_path"] = dest_path
 
         if confidence >= config.ai_confidence_threshold:
@@ -409,24 +412,27 @@ def collect_simulation_row(
         else:
             row["status"] = f"⬇️ LowConf ({confidence:.2f})"
     else:
-        error = classification.get("error", "Unknown error") if classification else "No classification"
-        row["status"] = f"❌ {error[:30]}"
+        error = (
+            classification.get("error", "Unknown error")
+            if classification
+            else "No classification"
+        )
+        row["status"] = f"❌ {error[:50]}"
 
     return row
 ```
 
 ---
 
-## Files to Modify
+## Files Modified
 
 | File | Changes |
 |------|---------|
-| [`pipeline.py`](/pipeline.py) | Add `--process-searchable` and `--simulate` CLI flags |
-| | Add `process_searchable()` function |
-| | Add `simulate` parameter to `process_all()` |
-| | Add `print_simulation_table()`, `collect_simulation_row()` helpers |
-| [`src/ocr_engine.py`](/src/ocr_engine.py) | Add `extract_text_direct()` method |
-| [`requirements.txt`](/requirements.txt) | Add `tabulate` (optional, for nicer tables — fallback to manual formatting) |
+| [`pipeline.py`](/pipeline.py) | Added `--process-searchable` and `--simulate` CLI flags |
+| | Added `process_searchable()` function |
+| | Added `simulate` parameter to `process_all()` |
+| | Added `print_simulation_table()`, `collect_simulation_row()` helpers |
+| [`src/ocr_engine.py`](/src/ocr_engine.py) | Added `extract_text_direct()` method with OCR fallback |
 
 ---
 
