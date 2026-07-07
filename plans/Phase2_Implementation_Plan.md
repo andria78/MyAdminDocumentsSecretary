@@ -1,10 +1,10 @@
-# Phase 2: AI Classification + Intelligent Renaming — Implementation Plan
+# Phase 2: AI Classification + Intelligent Renaming + Searchable Folder + Simulation Mode — Implementation Plan
 
 > **Based on**: `DocumentOCRProcessingPipeline_Final.md`
 > **Goal**: Add AI-powered document classification using Ollama + Qwen2.5 7B to identify the person, category, and suggest a meaningful filename for each document. After classification, route the searchable PDF to its destination (`{Person}/{Category}`) and rename it intelligently.
 > **Phase 1 delivers**: OCR → searchable PDF in intermediate folder. Phase 2 extends this with AI classification → routing to final destination with intelligent naming.
 >
-> **Phase 2 Extension**: This plan adds **sub-folder detection** (Section 4.2, Section 8), which is not present in the master plan (`DocumentOCRProcessingPipeline_Final.md`). Sub-folder detection allows documents to be routed into existing sub-folders within a category directory (e.g., `30-Eric/20-Achats&Fournisseurs/30-FournisseursEnergie/`). This feature is optional and can be disabled via `pipeline.routing.enable_subfolder_detection: false`.
+> **Phase 2 Extension**: This plan adds **sub-folder detection** (Section 4.2, Section 8), **searchable folder processing** (Section 13), and **simulation mode** (Section 14), which are not present in the master plan (`DocumentOCRProcessingPipeline_Final.md`). Sub-folder detection allows documents to be routed into existing sub-folders within a category directory (e.g., `30-Eric/20-Achats&Fournisseurs/30-FournisseursEnergie/`). Searchable folder processing allows processing PDFs already in the searchable folder (digital-born documents) using fast direct text extraction. Simulation mode allows previewing classification results as a table without moving any files.
 
 ---
 
@@ -15,8 +15,9 @@
 | Component | New/Modified | Description |
 |-----------|-------------|-------------|
 | [`src/ai_classifier.py`](#2-ai-classifier-srcai_classifierpy) | **New** | Ollama API integration for document classification |
-| [`pipeline.py`](#4-updated-pipeline-flow) | **Modified** | Adds AI classification stage + file routing after OCR |
+| [`pipeline.py`](#4-updated-pipeline-flow) | **Modified** | Adds AI classification stage + file routing after OCR; adds `process_searchable()` for searchable folder processing; adds simulation mode with `--simulate` flag |
 | [`src/config_manager.py`](#3-config-manager-updates) | **Modified** | Adds AI-related config properties + `person_categories_path` |
+| [`src/ocr_engine.py`](#131-occrengineextract_text_direct) | **Modified** | Adds `extract_text_direct()` method for fast text extraction from already-searchable PDFs |
 | [`config.yaml`](#config-file-changes) | **Modified** | Person categories path added |
 | [`config.test.yaml`](#config-file-changes) | **Modified** | Person categories path added |
 | [`tests/real_sources.yaml`](#52-testsreal_sourcesyaml--new-file) | **New** | Configuration file listing 10 real documents to use for validation |
@@ -608,11 +609,48 @@ flowchart TD
 
 ### 4.4 CLI Changes
 
-No new CLI arguments for Phase 2. The existing `--process` command now includes AI classification automatically. However, if Ollama is not available, the pipeline should gracefully degrade:
+Phase 2 adds four CLI execution modes:
 
+| Mode | Flag(s) | Description |
+|------|---------|-------------|
+| Process raw scans | `--process` | OCR → classify → route (existing Phase 1 behavior extended) |
+| Process searchable | `--process-searchable` | Direct text extraction → classify → route (NEW) |
+| Simulation (raw) | `--process --simulate` | OCR → classify → preview table (NEW) |
+| Simulation (searchable) | `--process-searchable --simulate` | Direct text extraction → classify → preview table (NEW) |
+
+If Ollama is not available, the pipeline gracefully degrades:
 - **Ollama not reachable**: Log error, skip classification, leave files in intermediate folder, continue processing remaining files
 - **Classification error on one file**: Log error, skip routing for that file, continue with next file
 - **Sub-folder AI call fails**: Log warning, fall back to top-level routing, continue
+
+**CLI argument definitions** (added to existing `--process` and `--config`):
+
+```python
+parser.add_argument(
+    "--process-searchable",
+    action="store_true",
+    help="Process PDF files already in the searchable folder (skip OCR, go direct to AI classification)",
+)
+
+parser.add_argument(
+    "--simulate",
+    action="store_true",
+    help="Run in simulation mode: show classification results as a table without moving or deleting any files",
+)
+```
+
+**Execution logic**:
+
+```python
+if args.simulate:
+    logger.info("SIMULATION MODE — no files will be moved or deleted")
+
+processed = 0
+if args.process_searchable:
+    processed = process_searchable(config, simulate=args.simulate)
+elif args.process:
+    processed = process_all(config, simulate=args.simulate)
+```
 
 ### 4.5 Safe Deletion Refinements
 
@@ -683,14 +721,81 @@ src/ai_classifier.py
 1. Add `from src.ai_classifier import AIClassifier` import
 2. Add `import shutil` for file operations
 3. Add helper functions: `load_person_hierarchy()`, `build_destination_path()`, `scan_category_sub_folders()`, `route_to_destination()`
-4. Modify `process_all()` to add AI classification and routing after OCR step
-5. Update logging messages
+4. Add simulation helpers: `collect_simulation_row()`, `print_simulation_table()`
+5. Modify `process_all()` to add AI classification and routing after OCR step, and accept `simulate` parameter
+6. Add `process_searchable()` for processing files already in the searchable folder
+7. Update CLI with `--process-searchable` and `--simulate` flags
+8. Update logging messages
 
 ### 5.3 [`src/config_manager.py`](src/config_manager.py) — MODIFIED
 
 **Changes**: Add 9 new properties (see [Section 3.1](#31-new-properties-in-srcconfig_managerpy)) and `load_person_categories()` method.
 
-### 5.4 [`config.yaml`](config.yaml) & [`config.test.yaml`](config.test.yaml) — MODIFIED
+### 5.4 [`src/ocr_engine.py`](src/ocr_engine.py) — MODIFIED
+
+**Changes**: Add `extract_text_direct()` method for fast text extraction from already-searchable PDFs.
+
+#### 5.4.1 `OCREngine.extract_text_direct()`
+
+Rather than re-running the full OCR pipeline (render → Tesseract → embed), use PyMuPDF's built-in `page.get_text()` to extract the existing text layer directly. This is orders of magnitude faster. If no text layer is found, it falls back to full OCR via `process_pdf()`.
+
+```python
+def extract_text_direct(self, pdf_path: str) -> dict:
+    """
+    Extract text directly from an already-searchable PDF using PyMuPDF's
+    built-in text extraction. Does NOT run Tesseract OCR.
+
+    If the PDF has no text layer, falls back to running OCR via process_pdf()
+    so that even scanned PDFs placed in the searchable folder are handled.
+
+    Args:
+        pdf_path: Path to a searchable PDF file.
+
+    Returns:
+        dict with:
+            - success: bool
+            - text: str (extracted text from all pages)
+            - page_count: int
+            - error: str (if failed)
+    """
+    if not os.path.isfile(pdf_path):
+        return {"success": False, "text": "", "page_count": 0,
+                "error": f"File not found: {pdf_path}"}
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        return {"success": False, "text": "", "page_count": 0,
+                "error": f"Failed to open PDF: {e}"}
+
+    page_count = len(doc)
+    full_text_parts = []
+    for page_num in range(page_count):
+        page = doc[page_num]
+        text = page.get_text()  # Direct text extraction — no OCR needed
+        if text and text.strip():
+            full_text_parts.append(text.strip())
+
+    doc.close()
+
+    full_text = "\n\n".join(full_text_parts).strip()
+
+    # If no text was found via direct extraction, fall back to OCR
+    if not full_text:
+        logger.info(
+            "No text layer found in %s — falling back to OCR", pdf_path
+        )
+        return self.process_pdf(pdf_path, pdf_path)
+
+    return {
+        "success": True,
+        "text": full_text,
+        "page_count": page_count,
+        "error": None,
+    }
+```
+
+### 5.5 [`config.yaml`](config.yaml) & [`config.test.yaml`](config.test.yaml) — MODIFIED
 
 **Changes**: Add `person_categories_path`, `rename_prefix`, and `routing:` section under `pipeline`:
 
@@ -713,7 +818,7 @@ The `rename_prefix` controls which files get renamed by AI:
 - Any other string: files starting with that string will be renamed
 - **In test mode** (when `test_mode.enabled` is true): The test prefix is stripped using regex pattern `__TEST_[SR]\d{2}__` before checking `rename_prefix`. This handles both synthetic (`__TEST_S01__`) and real (`__TEST_R03__`) test file formats. The stripping is only applied when `test_mode.enabled` is true, so production files are never affected.
 
-### 5.5 [`tests/real_sources.yaml`](tests/real_sources.yaml) — NEW FILE
+### 5.6 [`tests/real_sources.yaml`](tests/real_sources.yaml) — NEW FILE
 
 **Purpose**: Configuration file listing real documents to copy for testing with `__TEST_R__` prefix. This enables testing the AI classifier and pipeline against real-world scanned documents (variable quality, realistic OCR challenges), not just clean synthetic PDFs.
 
@@ -749,7 +854,7 @@ real_documents:
 
 **Safety**: The file only lists source paths. It NEVER moves or modifies the originals. The copy script creates duplicates with the `__TEST_R__` prefix.
 
-### 5.6 [`scripts/copy_real_test_data.py`](scripts/copy_real_test_data.py) — NEW FILE
+### 5.7 [`scripts/copy_real_test_data.py`](scripts/copy_real_test_data.py) — NEW FILE
 
 **Purpose**: Reads `tests/real_sources.yaml`, copies each listed document to `/Volumes/Public/-ScansImprimante/` with the `__TEST_R__{NN}__` prefix, and records the mapping in a JSON manifest for traceability.
 
@@ -795,6 +900,10 @@ python scripts/copy_real_test_data.py --manifest tests/test_data/REAL/manifest.j
 | **Sub-folder detection** | Dynamic scan at routing time | No YAML changes needed. Sub-folders are discovered automatically. |
 | **Sub-folder confidence threshold** | 0.5 (lower than primary 0.7) | Sub-folder choice is a simpler decision. Lower threshold reduces false top-level fallbacks. |
 | **Sub-folder depth** | 1 level only | Avoids complexity of recursive nesting. Users can organize within 1 level. |
+| **Searchable folder text extraction** | `page.get_text()` (PyMuPDF) | Orders of magnitude faster than re-running Tesseract OCR. Native PDF text layer access. |
+| **Searchable folder OCR fallback** | `process_pdf()` in-place | Handles edge case where a scanned PDF was mistakenly placed in the searchable folder. |
+| **Simulation display** | Python built-in string formatting | No external dependencies needed. `tabulate` or `rich` could be used optionally. |
+| **Simulation file safety** | No `shutil.copy2`, no `os.remove` | Zero file system mutations. Purely in-memory path building. |
 
 ---
 
@@ -851,6 +960,8 @@ PyYAML>=6.0
 requests>=2.28.0          # NEW — HTTP client for Ollama API
 ```
 
+No new external dependencies for the simulation table or searchable folder features. The table formatting uses Python's built-in string formatting. If `tabulate` or `rich` is available, we can use it for prettier output, but it's optional.
+
 ---
 
 ## 10. Pre-Implementation Checklist
@@ -874,14 +985,15 @@ Before Code mode starts, ensure:
 1. **Update `requirements.txt`** — Add `requests`
 2. **Update `src/config_manager.py`** — Add AI-related properties + `load_person_categories()` + routing properties
 3. **Create `src/ai_classifier.py`** — The core new module (including `classify_subfolder()`)
-4. **Update `config.yaml`** and **`config.test.yaml`** — Add `person_categories_path`, `rename_prefix`, `routing:` section
-5. **Update `pipeline.py`** — Integrate AI classification + file routing + sub-folder detection
-6. **Create `tests/real_sources.yaml`** — Configure 10 real document paths (user fills in actual paths)
-7. **Create `scripts/copy_real_test_data.py`** — Script to copy real docs with `__TEST_R__` prefix
-8. **Update `scripts/generate_test_data.py`** — Modify naming: 5 files with `SCN` base name and 4 files with descriptive base name to test `rename_prefix` logic; **add S11 + S12 for sub-folder routing validation**
-9. **Update `scripts/cleanup_test_data.sh`** — Add cleanup of test sub-folders created for sub-folder validation (delete `30-FournisseursEnergie`, `40-FournisseursInternet` from Eric and Famille categories)
-10. **Step 1 validation: synthetic test data (12 documents)** — Validate classification accuracy + rename_prefix behavior + sub-folder routing with known ground truth
-11. **Step 2 validation: real test data** — Validate classification robustness with real-world documents
+4. **Update `src/ocr_engine.py`** — Add `extract_text_direct()` method with OCR fallback
+5. **Update `config.yaml`** and **`config.test.yaml`** — Add `person_categories_path`, `rename_prefix`, `routing:` section
+6. **Update `pipeline.py`** — Integrate AI classification + file routing + sub-folder detection + simulation helpers + `process_searchable()`
+7. **Create `tests/real_sources.yaml`** — Configure 10 real document paths (user fills in actual paths)
+8. **Create `scripts/copy_real_test_data.py`** — Script to copy real docs with `__TEST_R__` prefix
+9. **Update `scripts/generate_test_data.py`** — Modify naming: 5 files with `SCN` base name and 4 files with descriptive base name to test `rename_prefix` logic; **add S11 + S12 for sub-folder routing validation**
+10. **Update `scripts/cleanup_test_data.sh`** — Add cleanup of test sub-folders created for sub-folder validation (delete `30-FournisseursEnergie`, `40-FournisseursInternet` from Eric and Famille categories)
+11. **Step 1 validation: synthetic test data (12 documents)** — Validate classification accuracy + rename_prefix behavior + sub-folder routing with known ground truth
+12. **Step 2 validation: real test data** — Validate classification robustness with real-world documents
 
 ---
 
@@ -952,7 +1064,7 @@ After the pipeline completes, verify:
 
 ### 12.2 Step 2 — Real Document Validation (Real-World Quality)
 
-Before running this step, you must fill in [`tests/real_sources.yaml`](tests/real_sources.yaml) with paths to 10 real documents on your NAS (see [Section 5.5](#55-testsreal_sourcesyaml--new-file) for selection criteria).
+Before running this step, you must fill in [`tests/real_sources.yaml`](tests/real_sources.yaml) with paths to 10 real documents on your NAS (see [Section 5.5](#55-configyaml--configtestyaml--modified) for selection criteria).
 
 ```bash
 # Copy 10 real documents to scanner folder with __TEST_R__ prefix
@@ -1025,6 +1137,10 @@ rm -rf "/Volumes/Administratif/20-Famille/20-Achats&Fournisseurs/30-Fournisseurs
 | 14 | **S11** (no sub-folder match) stays at top level of `20-Achats&Fournisseurs` | |
 | 15 | **S12** (sub-folder match) routed into `30-FournisseursEnergie` sub-folder | |
 | 16 | `enable_subfolder_detection: false` → no sub-folder routing attempted | |
+| 17 | `--process-searchable` processes files in searchable folder successfully | |
+| 18 | `--simulate` shows classification table without moving/deleting files | |
+| 19 | `--process --simulate` and `--process-searchable --simulate` both work | |
+| 20 | Searchable folder text extraction fallback works (OCR runs when no text layer) | |
 
 ### 12.5 Classification Accuracy Table (Known Ground Truth — 12 Documents)
 
@@ -1051,21 +1167,200 @@ rm -rf "/Volumes/Administratif/20-Famille/20-Achats&Fournisseurs/30-Fournisseurs
 
 ---
 
-## 13. Folder Structure After Phase 2
+## 13. Searchable Folder Processing
+
+### 13.1 Motivation
+
+Currently, the pipeline only ingests files from `raw_scans_folder`, OCRs them, and outputs to `searchable_pdf_folder`. However, there may already be files in the searchable folder (placed manually, downloaded, emailed) that need classification and routing.
+
+### 13.2 Flow
+
+```
+searchable_pdf_folder (00-ScansNonTries/)
+    │
+    ▼
+[Direct text extraction via PyMuPDF page.get_text()]
+    │
+    ├── Text found ──► [AI Classification] ──► [Routing] ──► [Delete source]
+    │
+    └── No text ──► [Fallback to OCR via process_pdf()] ──► [AI Classification] ──► [Routing] ──► [Delete source]
+```
+
+### 13.3 Implementation: `process_searchable()` in [`pipeline.py`](pipeline.py:726)
+
+This mirrors `process_all()` but:
+- Scans `searchable_pdf_folder` instead of `raw_scans_folder`
+- Uses `extract_text_direct()` from OCREngine instead of `ocr_engine.process_pdf()`
+- Goes straight to AI classification + routing
+- Deletes source file from searchable folder on successful routing
+
+**Function signature**:
+
+```python
+def process_searchable(config: ConfigManager, simulate: bool = False) -> int:
+    """
+    Process PDF files already in the searchable PDF folder.
+
+    These files are already digital/searchable, so they skip the full OCR step
+    and go directly to AI classification + routing. If a file has no text layer,
+    OCR is run as a fallback.
+
+    Args:
+        config: Pipeline configuration.
+        simulate: If True, run classification only and display results as a
+                  table without moving or deleting any files.
+
+    Returns:
+        Number of files successfully processed (or simulated).
+    """
+```
+
+### 13.4 Edge Cases — Searchable Folder
+
+| Scenario | Behavior |
+|----------|----------|
+| **Already-processed files** | Process them — they'll be deleted after routing. No duplicate detection in Phase 2. |
+| **Text extraction fails** (PDF has no text layer) | Fall back to running OCR on it. Log a warning. |
+| **Simulation + --process-searchable** | Both flags combinable. Simulation table shows results for searchable files only. |
+| **No AI classifier available** (Ollama down) | Log error, return 0. Files left in searchable folder. |
+| **Empty searchable folder** | Graceful: "No PDF files found" message. |
+
+---
+
+## 14. Simulation Mode
+
+### 14.1 Motivation
+
+Test the AI classification quality without actually moving files. Display results in a clean table so the user can verify:
+- Is the AI identifying the correct person?
+- Is the category appropriate?
+- Is the suggested filename meaningful?
+- What would the final destination path be?
+
+### 14.2 Implementation
+
+#### A. `simulate` parameter in `process_all()` and `process_searchable()`
+
+When `simulate=True`:
+- Run OCR / text extraction as normal (needed for text)
+- Run AI classification as normal
+- **COLLECT** results instead of calling `route_to_destination()`
+- Do **NOT** delete raw scans or intermediate files
+- Return collected results for table display
+
+#### B. Helper: `collect_simulation_row()` in [`pipeline.py`](pipeline.py:258)
+
+Collects a single row of simulation data without performing any file operations:
+
+```python
+def collect_simulation_row(
+    source: str,
+    filename: str,
+    classification: dict | None,
+    config: ConfigManager,
+) -> dict:
+    """
+    Collect a single row of simulation data without performing any file operations.
+
+    Returns:
+        dict with row data for the simulation table:
+        - source_file, source_path, person, category, suggested_filename,
+          confidence, destination_path, subfolder, status
+    """
+```
+
+#### C. Simulation table display: `print_simulation_table()` in [`pipeline.py`](pipeline.py:332)
+
+Uses Python's built-in string formatting (no external dependencies).
+
+**Table columns**:
+
+| # | Source File | Person | Category | Suggested Filename | Confidence | Status |
+|---|------------|--------|----------|-------------------|------------|--------|
+| 1 | SCN_0042.pdf | Eric | 20-Achats&Fournisseurs | Facture_Orange_2024-03 | 0.95 | ✅ Route |
+
+After the table, full destination paths are printed for each file.
+
+#### D. Key differences when `simulate=True`
+
+In both `process_all()` and `process_searchable()`:
+- Skip `route_to_destination()` — no file copy
+- Skip `os.remove()` — no file deletion
+- Build destination path string in-memory only
+- Append result row to a simulation results list
+- Call `print_simulation_table()` after processing all files
+
+### 14.3 Simulation Mode Examples
+
+```bash
+# Process raw scans in simulation mode (preview only)
+python pipeline.py --process --simulate
+
+# Process searchable folder files in simulation mode
+python pipeline.py --process-searchable --simulate
+
+# With custom config
+python pipeline.py --process --simulate --config config.test.yaml
+```
+
+---
+
+## 15. Architecture Diagram
+
+```mermaid
+flowchart TD
+    subgraph CLI["CLI Entry Point main()"]
+        C1[--process]
+        C2[--process-searchable]
+        C3[--simulate]
+    end
+
+    subgraph Process["process_all()"]
+        RAW[raw_scans_folder] --> OCR[OCREngine.process_pdf]
+        OCR --> AI_CLASSIFY[AIClassifier.classify]
+    end
+
+    subgraph ProcessSearchable["process_searchable()"]
+        SEARCHABLE[searchable_pdf_folder] --> EXTRACT[OCREngine.extract_text_direct]
+        EXTRACT --> AI_CLASSIFY2[AIClassifier.classify]
+    end
+
+    subgraph Simulate["Simulation Mode"]
+        AI_CLASSIFY --> COLLECT[collect_simulation_row]
+        AI_CLASSIFY2 --> COLLECT
+        COLLECT --> TABLE[print_simulation_table]
+        TABLE --> NOOP["No file moves / deletes"]
+    end
+
+    subgraph Route["Normal Mode"]
+        AI_CLASSIFY --> ROUTE[route_to_destination]
+        AI_CLASSIFY2 --> ROUTE
+        ROUTE --> DELETE["Delete source files"]
+    end
+
+    C1 -- no --simulate --> Process --> Route
+    C1 -- with --simulate --> Process --> Simulate
+    C2 -- no --simulate --> ProcessSearchable --> Route
+    C2 -- with --simulate --> ProcessSearchable --> Simulate
+```
+
+---
+
+## 16. Folder Structure After Phase 2
 
 ```
 MyAdminDocumentsSecretary/
 ├── config.yaml                     # Production config (updated)
 ├── config.test.yaml                # Test config (updated)
 ├── person_categories.yaml          # Person/category hierarchy
-├── pipeline.py                     # CLI entry point (UPDATED with AI + routing + sub-folder detection)
+├── pipeline.py                     # CLI entry point (UPDATED with AI + routing + sub-folder detection + searchable + simulation)
 ├── requirements.txt                # Updated with requests
 ├── .gitignore
 │
 ├── src/
 │   ├── __init__.py
 │   ├── config_manager.py           # UPDATED with AI + routing properties
-│   ├── ocr_engine.py               # Unchanged from Phase 1
+│   ├── ocr_engine.py               # UPDATED with extract_text_direct()
 │   └── ai_classifier.py            # NEW — AI classification module (primary + sub-folder)
 │
 ├── scripts/
@@ -1086,7 +1381,28 @@ MyAdminDocumentsSecretary/
 
 ---
 
-## 14. Potential Risks & Mitigations
+## 17. Usage Examples
+
+```bash
+# Process new raw scans (existing behavior)
+python pipeline.py --process
+
+# Process raw scans in simulation mode (preview only)
+python pipeline.py --process --simulate
+
+# Process files already in the searchable folder
+python pipeline.py --process-searchable
+
+# Process searchable folder files in simulation mode
+python pipeline.py --process-searchable --simulate
+
+# With custom config
+python pipeline.py --process-searchable --config config.test.yaml
+```
+
+---
+
+## 18. Potential Risks & Mitigations
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
@@ -1102,3 +1418,5 @@ MyAdminDocumentsSecretary/
 | **Real document has unreadable scanner quality** | High | Medium — OCR failure or low confidence | Expected for real-world data; flagged for manual review |
 | **Real document contains sensitive PII in tests** | Medium | Medium — data leakage risk | `__TEST_R__` prefix makes copies identifiable; cleanup script deletes all test copies |
 | **Sub-folder AI misclassifies** | Low | Low — wrong sub-folder | Fallback to top-level if confidence < 0.5. File still accessible in correct category. |
+| **Searchable folder PDF corrupt** | Low | Low — file skipped | `extract_text_direct()` catches PyMuPDF open errors, logs error, continues |
+| **Simulation mode confusion** (user thinks files were processed) | Low | Medium — files not actually routed | Prominent "SIMULATION MODE" log message; table shows simulation results explicitly |
