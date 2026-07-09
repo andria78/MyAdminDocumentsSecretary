@@ -150,6 +150,16 @@ class ConfigManager:
         return self.get("pipeline.rename_prefix", "SCN")
 
     @property
+    def rename_pdfsam(self) -> bool:
+        """
+        Whether to rename files containing 'pdfsam' in their name.
+        When True, files like 'pdfsam_basic_12345.pdf' will be renamed
+        to their AI-suggested filename, in addition to SCN-prefixed files.
+        Default: True.
+        """
+        return self.get("pipeline.rename_pdfsam", True)
+
+    @property
     def enable_subfolder_detection(self) -> bool:
         """Whether to scan for and route into existing sub-folders in category directories."""
         return self.get("pipeline.routing.enable_subfolder_detection", True)

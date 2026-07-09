@@ -3,7 +3,8 @@ pipeline:
   searchable_pdf_folder: "/Volumes/Administratif/00-ScansNonTries"
   destination_base_folder: "/Volumes/Administratif"
   person_categories_path: "person_categories.yaml"
-  rename_prefix: "SCN"
+  rename_prefix: "SCN"          # Files starting with this prefix get AI-renamed
+  rename_pdfsam: true           # Also rename files containing "pdfsam" (case-insensitive)
 
   polling:
     enabled: true

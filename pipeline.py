@@ -95,6 +95,41 @@ def strip_test_prefix(filename: str) -> str:
     return re.sub(r'^__TEST_[SR]\d{2}__', '', filename)
 
 
+def should_rename_file(effective_filename: str, config: ConfigManager) -> bool:
+    """
+    Determine if a file should be renamed based on its name and config.
+
+    Checks two conditions:
+    1. File starts with the configured rename_prefix (e.g., "SCN").
+    2. File contains 'pdfsam' (case-insensitive) when rename_pdfsam is enabled.
+    3. If rename_prefix is an empty string, ALL files are renamed.
+
+    Args:
+        effective_filename: Filename with test prefix stripped (if in test mode).
+        config: Pipeline configuration.
+
+    Returns:
+        True if the file should be renamed to AI-suggested name.
+    """
+    rename_prefix = config.rename_prefix
+
+    # If rename_prefix is empty, rename ALL files
+    if not rename_prefix:
+        return True
+
+    # Check if filename starts with the prefix (e.g., "SCN")
+    if effective_filename.startswith(rename_prefix):
+        return True
+
+    # Check if rename_pdfsam is enabled and filename contains "pdfsam"
+    if config.rename_pdfsam:
+        # Case-insensitive check for "pdfsam" anywhere in the filename
+        if "pdfsam" in effective_filename.lower():
+            return True
+
+    return False
+
+
 def load_person_hierarchy(config: ConfigManager) -> dict:
     """Load and return the person/category hierarchy from YAML."""
     return config.load_person_categories()
@@ -380,14 +415,10 @@ def collect_simulation_row(
         if config.test_mode_enabled:
             effective_filename = strip_test_prefix(filename)
 
-        rename_prefix = config.rename_prefix
-        if rename_prefix:
-            if effective_filename.startswith(rename_prefix):
-                final_filename = f"{suggested}.pdf"
-            else:
-                final_filename = filename
-        else:
+        if should_rename_file(effective_filename, config):
             final_filename = f"{suggested}.pdf"
+        else:
+            final_filename = filename
 
         # Build destination path (in-memory only — no file operations)
         dest_path = build_destination_path(config, person, category, final_filename)
@@ -1619,16 +1650,23 @@ def process_all(
                 )
                 logger.debug("AI reasoning: %s", classification.get("reasoning", ""))
 
-                # Determine final filename based on rename_prefix
+                # Determine final filename based on rename rules
                 # In test mode, strip test prefix first
                 effective_filename = filename
                 if config.test_mode_enabled:
                     effective_filename = strip_test_prefix(filename)
 
-                rename_prefix = config.rename_prefix
-                if rename_prefix:
-                    if effective_filename.startswith(rename_prefix):
-                        final_filename = f"{suggested_filename}.pdf"
+                if should_rename_file(effective_filename, config):
+                    final_filename = f"{suggested_filename}.pdf"
+                    # Determine the reason for renaming (for log clarity)
+                    rename_prefix = config.rename_prefix
+                    if not rename_prefix:
+                        logger.info(
+                            "Filename renamed (rename_prefix=''): %s → %s",
+                            filename,
+                            final_filename,
+                        )
+                    elif effective_filename.startswith(rename_prefix):
                         logger.info(
                             "Filename renamed: %s → %s (prefix '%s' matched)",
                             filename,
@@ -1636,19 +1674,18 @@ def process_all(
                             rename_prefix,
                         )
                     else:
-                        final_filename = filename
                         logger.info(
-                            "Filename kept: %s (prefix '%s' not matched on '%s')",
+                            "Filename renamed: %s → %s (pdfsam pattern matched)",
                             filename,
-                            rename_prefix,
-                            effective_filename,
+                            final_filename,
                         )
                 else:
-                    final_filename = f"{suggested_filename}.pdf"
+                    final_filename = filename
+                    rename_prefix = config.rename_prefix
                     logger.info(
-                        "Filename renamed (rename_prefix=''): %s → %s",
+                        "Filename kept: %s (prefix '%s' not matched, pdfsam not found)",
                         filename,
-                        final_filename,
+                        rename_prefix,
                     )
 
                 # Check confidence threshold
@@ -1757,14 +1794,10 @@ def process_all(
             if config.test_mode_enabled:
                 effective_filename = strip_test_prefix(filename)
 
-            rename_prefix = config.rename_prefix
-            if rename_prefix:
-                if effective_filename.startswith(rename_prefix):
-                    final_filename = f"{suggested_filename}.pdf"
-                else:
-                    final_filename = filename
-            else:
+            if should_rename_file(effective_filename, config):
                 final_filename = f"{suggested_filename}.pdf"
+            else:
+                final_filename = filename
 
             # Route to destination
             dest_base = config.destination_base_folder
@@ -2049,15 +2082,22 @@ def process_searchable(
                     "AI reasoning: %s", classification.get("reasoning", "")
                 )
 
-                # Determine final filename
+                # Determine final filename based on rename rules
                 effective_filename = filename
                 if config.test_mode_enabled:
                     effective_filename = strip_test_prefix(filename)
 
-                rename_prefix = config.rename_prefix
-                if rename_prefix:
-                    if effective_filename.startswith(rename_prefix):
-                        final_filename = f"{suggested_filename}.pdf"
+                if should_rename_file(effective_filename, config):
+                    final_filename = f"{suggested_filename}.pdf"
+                    # Determine the reason for renaming (for log clarity)
+                    rename_prefix = config.rename_prefix
+                    if not rename_prefix:
+                        logger.info(
+                            "Filename renamed (rename_prefix=''): %s → %s",
+                            filename,
+                            final_filename,
+                        )
+                    elif effective_filename.startswith(rename_prefix):
                         logger.info(
                             "Filename renamed: %s → %s (prefix '%s' matched)",
                             filename,
@@ -2065,19 +2105,18 @@ def process_searchable(
                             rename_prefix,
                         )
                     else:
-                        final_filename = filename
                         logger.info(
-                            "Filename kept: %s (prefix '%s' not matched on '%s')",
+                            "Filename renamed: %s → %s (pdfsam pattern matched)",
                             filename,
-                            rename_prefix,
-                            effective_filename,
+                            final_filename,
                         )
                 else:
-                    final_filename = f"{suggested_filename}.pdf"
+                    final_filename = filename
+                    rename_prefix = config.rename_prefix
                     logger.info(
-                        "Filename renamed (rename_prefix=''): %s → %s",
+                        "Filename kept: %s (prefix '%s' not matched, pdfsam not found)",
                         filename,
-                        final_filename,
+                        rename_prefix,
                     )
 
                 if confidence >= config.ai_confidence_threshold:
@@ -2182,14 +2221,10 @@ def process_searchable(
             if config.test_mode_enabled:
                 effective_filename = strip_test_prefix(filename)
 
-            rename_prefix = config.rename_prefix
-            if rename_prefix:
-                if effective_filename.startswith(rename_prefix):
-                    final_filename = f"{suggested_filename}.pdf"
-                else:
-                    final_filename = filename
-            else:
+            if should_rename_file(effective_filename, config):
                 final_filename = f"{suggested_filename}.pdf"
+            else:
+                final_filename = filename
 
             # Route to destination
             dest_base = config.destination_base_folder
