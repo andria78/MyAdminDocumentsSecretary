@@ -1,0 +1,62 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Pipeline: Process Searchable",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--process-searchable"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Process Searchable (Simulate)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--process-searchable",
+                "--simulate"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Process Raw Scans",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--process"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Process Raw Scans (Simulate)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--process",
+                "--simulate"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Rebuild from Log",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--rebuild-from-log"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
