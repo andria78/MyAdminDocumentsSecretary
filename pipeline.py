@@ -19,6 +19,7 @@ import signal
 import sys
 import hashlib
 from datetime import datetime
+from dataclasses import dataclass, field
 
 from src.config_manager import ConfigManager
 from src.ocr_engine import OCREngine
@@ -883,6 +884,519 @@ def print_report_summary(success_path: str, failure_path: str, results: list[dic
         dest = row.get("destination_path", "N/A")
         print(f"  {i}. {dest}")
     print()
+
+
+# ── Undo from Log functions ────────────────────────────────────────────────
+
+
+@dataclass
+class UndoRecord:
+    """Represents a file that was routed and can be undone."""
+    source_file: str
+    final_filename: str
+    person: str
+    category: str
+    destination_path: str
+    confidence: float
+    sub_folder: str | None = None
+    timestamp: datetime | None = None
+    checksum_status: str = "checksum verified"
+    original_path_in_dest: str = ""
+    searchable_path: str = ""
+
+
+def parse_undo_records(
+    log_path: str,
+    config: ConfigManager,
+) -> list[UndoRecord]:
+    """
+    Parse the log file and extract routing records suitable for undo.
+
+    Args:
+        log_path: Path to the log file.
+        config: Pipeline configuration.
+
+    Returns:
+        List of UndoRecord instances.
+    """
+    logger = logging.getLogger("pipeline")
+    logger.info("Parsing log file for undo records: %s", log_path)
+
+    records: list[UndoRecord] = []
+
+    # Regex patterns for log parsing
+    processing_pattern = re.compile(r"Processing: (.+?)$")
+    ai_classification_pattern = re.compile(
+        r"AI classification: person=(.+?), category=(.+?), confidence=([0-9.]+), suggested=(.+?)(?:,|$)"
+    )
+    filename_renamed_pattern = re.compile(
+        r"Filename (renamed|kept): (.+?) → (.+?) \((.+?)\)"
+    )
+    copied_pattern = re.compile(r"Copied to: (.+)$")
+    routed_pattern = re.compile(
+        r"Successfully routed to: (.+?) \((checksum verified|checksum mismatch)\)"
+    )
+    subfolder_routed_pattern = re.compile(
+        r"📁 Sub-folder routed: (.+?)/(.+?)/(.*?) \(confidence: ([0-9.]+), threshold: ([0-9.]+)\)"
+    )
+    deleted_intermediate_pattern = re.compile(
+        r"Deleted intermediate file: (.+)$"
+    )
+    deleted_raw_pattern = re.compile(
+        r"Deleted raw scan: (.+)$"
+    )
+
+    # State tracking for multi-line log entries
+    current_source = None
+    current_ai_data: dict = {}
+    current_filename_change: dict = {}
+    current_copied_path: str = ""
+    current_sub_folder: str | None = None
+    current_checksum: str = "checksum verified"
+    current_timestamp: datetime | None = None
+
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            # Extract timestamp
+            try:
+                ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                if ts_match:
+                    current_timestamp = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+            # Track current file from Processing message
+            file_start_match = processing_pattern.search(line)
+            if file_start_match:
+                # Finalize previous record if exists
+                if current_source and current_ai_data:
+                    records.append(UndoRecord(
+                        source_file=current_source,
+                        final_filename=current_filename_change.get("final_filename", current_source),
+                        person=current_ai_data.get("person", "N/A"),
+                        category=current_ai_data.get("category", "N/A"),
+                        destination_path=current_copied_path,
+                        confidence=current_ai_data.get("confidence", 0.0),
+                        sub_folder=current_sub_folder,
+                        timestamp=current_timestamp,
+                        checksum_status=current_checksum,
+                        original_path_in_dest=current_copied_path,
+                        searchable_path=config.searchable_pdf_folder,
+                    ))
+
+                # Reset state for new file
+                current_source = file_start_match.group(1)
+                current_ai_data = {}
+                current_filename_change = {}
+                current_copied_path = ""
+                current_sub_folder = None
+                current_checksum = "checksum verified"
+                current_timestamp = None
+
+            # AI classification data
+            ai_match = ai_classification_pattern.search(line)
+            if ai_match:
+                current_ai_data = {
+                    "person": ai_match.group(1),
+                    "category": ai_match.group(2),
+                    "confidence": float(ai_match.group(3)),
+                    "suggested_filename": ai_match.group(4).rstrip(","),
+                }
+
+            # Filename change
+            rename_match = filename_renamed_pattern.search(line)
+            if rename_match:
+                action = rename_match.group(1)
+                if action == "renamed":
+                    current_filename_change["final_filename"] = rename_match.group(3)
+                else:
+                    current_filename_change["final_filename"] = rename_match.group(2)
+
+            # Copied to path
+            copied_match = copied_pattern.search(line)
+            if copied_match:
+                current_copied_path = copied_match.group(1).strip()
+
+            # Sub-folder routed detection
+            subfolder_routed_match = subfolder_routed_pattern.search(line)
+            if subfolder_routed_match:
+                dest_path_for_subfolder = subfolder_routed_match.group(1)
+                path_parts = dest_path_for_subfolder.split('/')
+                if len(path_parts) >= 4:
+                    current_sub_folder = path_parts[-2]
+
+            # Successfully routed (finalize record)
+            routed_match = routed_pattern.search(line)
+            if routed_match:
+                current_checksum = routed_match.group(2)
+
+    # Finalize last record
+    if current_source and current_ai_data:
+        records.append(UndoRecord(
+            source_file=current_source,
+            final_filename=current_filename_change.get("final_filename", current_source),
+            person=current_ai_data.get("person", "N/A"),
+            category=current_ai_data.get("category", "N/A"),
+            destination_path=current_copied_path,
+            confidence=current_ai_data.get("confidence", 0.0),
+            sub_folder=current_sub_folder,
+            timestamp=current_timestamp,
+            checksum_status=current_checksum,
+            original_path_in_dest=current_copied_path,
+            searchable_path=config.searchable_pdf_folder,
+        ))
+
+    logger.info("Parsed %d undo records from log", len(records))
+    return records
+
+
+def filter_undo_records(
+    records: list[UndoRecord],
+    after: datetime | None = None,
+    before: datetime | None = None,
+    person: str | None = None,
+    category: str | None = None,
+    max_confidence: float | None = None,
+    min_confidence: float | None = None,
+    file: str | None = None,
+    count: int | None = None,
+) -> list[UndoRecord]:
+    """
+    Filter undo records based on criteria.
+
+    Args:
+        records: List of UndoRecord instances.
+        after: Only records after this date.
+        before: Only records before this date.
+        person: Only records for this person.
+        category: Only records for this category.
+        max_confidence: Only records with confidence <= this value.
+        min_confidence: Only records with confidence >= this value.
+        file: Only records matching this filename.
+        count: Only the N most recent records.
+
+    Returns:
+        Filtered list of UndoRecord instances.
+    """
+    filtered = records
+
+    if after:
+        filtered = [r for r in filtered if r.timestamp and r.timestamp >= after]
+
+    if before:
+        filtered = [r for r in filtered if r.timestamp and r.timestamp <= before]
+
+    if person:
+        filtered = [r for r in filtered if r.person.lower() == person.lower()]
+
+    if category:
+        filtered = [r for r in filtered if r.category.lower() == category.lower()]
+
+    if max_confidence is not None:
+        filtered = [r for r in filtered if r.confidence <= max_confidence]
+
+    if min_confidence is not None:
+        filtered = [r for r in filtered if r.confidence >= min_confidence]
+
+    if file:
+        filtered = [r for r in filtered if file.lower() in r.source_file.lower()]
+
+    if count is not None:
+        # Take the N most recent records (records are already in chronological order)
+        filtered = filtered[-count:]
+
+    return filtered
+
+
+def print_undo_preview(records: list[UndoRecord]) -> None:
+    """
+    Display a preview table of files to be undone.
+
+    Args:
+        records: List of UndoRecord instances to display.
+    """
+    if not records:
+        print("\n  No records to undo.\n")
+        return
+
+    print()
+    print("=" * 140)
+    print("  UNDO PREVIEW — Files to be restored to searchable folder")
+    print("=" * 140)
+
+    header = (
+        f"{'#':<4} {'Source File':<30} {'Final Name':<35} {'Person':<12} "
+        f"{'Category':<28} {'Confidence':<10} {'Sub-folder':<15}"
+    )
+    print(header)
+    print("-" * 140)
+
+    for i, record in enumerate(records, 1):
+        source = record.source_file
+        final = record.final_filename
+        person = record.person
+        category = record.category
+        conf = f"{record.confidence:.2f}"
+        sub = record.sub_folder or "N/A"
+
+        # Truncate long strings
+        source_display = source if len(source) <= 29 else source[:26] + "..."
+        final_display = final if len(final) <= 34 else final[:31] + "..."
+        sub_display = sub if len(sub) <= 14 else sub[:11] + "..."
+
+        print(
+            f"{i:<4} {source_display:<30} {final_display:<35} {person:<12} "
+            f"{category:<28} {conf:<10} {sub_display:<15}"
+        )
+
+    print("-" * 140)
+    print(f"  Total: {len(records)} file(s) to undo")
+    print("=" * 140)
+    print()
+
+
+def write_undo_report(
+    success_records: list[UndoRecord],
+    failures: list[dict],
+    report_dir: str,
+) -> str:
+    """
+    Append undo results to a cumulative report file.
+
+    Args:
+        success_records: List of successfully undone records.
+        failures: List of failure dicts with 'source_file' and 'error' keys.
+        report_dir: Directory to write the report to.
+
+    Returns:
+        Path to the written report file.
+    """
+    report_path = os.path.join(report_dir, "searchable_undo.md")
+    os.makedirs(report_dir, exist_ok=True)
+
+    is_new = not os.path.isfile(report_path)
+
+    with open(report_path, "a", encoding="utf-8") as f:
+        if is_new:
+            f.write("# Searchable Folder Processing — Undo Report\n\n")
+            f.write(
+                "This report accumulates undo results across all pipeline runs. "
+                "Each run is separated by a horizontal rule.\n\n"
+            )
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write("\n\n")
+        f.write("─" * 80)
+        f.write("\n\n")
+        f.write(f"## Undo Run: {now}\n\n")
+        f.write(f"Generated: {now}\n")
+        f.write(f"Total undone: {len(success_records)}\n")
+        f.write(f"Total failures: {len(failures)}\n\n")
+
+        if success_records:
+            f.write("### Restored Files\n\n")
+            f.write(
+                "| # | Source File | Final Name | Person | Category | "
+                "Destination | Confidence | Sub-folder |\n"
+            )
+            f.write(
+                "|---|------------|------------|--------|----------|"
+                "------------|------------|------------|\n"
+            )
+            for i, rec in enumerate(success_records, 1):
+                sub = rec.sub_folder or "N/A"
+                f.write(
+                    f"| {i} "
+                    f"| {rec.source_file} "
+                    f"| {rec.final_filename} "
+                    f"| {rec.person} "
+                    f"| {rec.category} "
+                    f"| {rec.destination_path} "
+                    f"| {rec.confidence:.2f} "
+                    f"| {sub} |\n"
+                )
+
+        if failures:
+            f.write("\n### Failures\n\n")
+            f.write("| # | Source File | Error |\n")
+            f.write("|---|------------|-------|\n")
+            for i, fail in enumerate(failures, 1):
+                f.write(
+                    f"| {i} "
+                    f"| {fail.get('source_file', 'N/A')} "
+                    f"| {fail.get('error', 'Unknown error')} |\n"
+                )
+
+    logger = logging.getLogger("pipeline")
+    logger.info("Undo report written to: %s", report_path)
+    return report_path
+
+
+def undo_from_log(
+    config: ConfigManager,
+    dry_run: bool = False,
+    after: datetime | None = None,
+    before: datetime | None = None,
+    person: str | None = None,
+    category: str | None = None,
+    max_confidence: float | None = None,
+    min_confidence: float | None = None,
+    file: str | None = None,
+    count: int | None = None,
+    restore_name: bool = False,
+    report_dir: str = "",
+) -> tuple[int, int]:
+    """
+    Undo routed files by parsing the log file.
+
+    Copies files back from their destination to the searchable folder.
+
+    Args:
+        config: Pipeline configuration.
+        dry_run: If True, preview without copying.
+        after: Only undo files processed after this date.
+        before: Only undo files processed before this date.
+        person: Only undo files for this person.
+        category: Only undo files for this category.
+        max_confidence: Only undo files with confidence <= this value.
+        min_confidence: Only undo files with confidence >= this value.
+        file: Only undo this specific file (by original name).
+        count: Only undo the N most recent files.
+        restore_name: If True, restore with original name instead of final name.
+        report_dir: Directory to write the undo report to.
+
+    Returns:
+        Tuple of (success_count, failure_count).
+    """
+    logger = logging.getLogger("pipeline")
+    logger.info("Starting undo from log")
+    logger.info("Configuration: dry_run=%s, restore_name=%s, count=%s", dry_run, restore_name, count)
+
+    # Determine report directory
+    if not report_dir:
+        report_dir = os.path.join(os.path.dirname(config.logging_file) or "logs", "reports")
+
+    # Parse log file
+    log_path = config.logging_file
+    if not os.path.isfile(log_path):
+        logger.error("Log file not found: %s", log_path)
+        return 0, 1
+
+    records = parse_undo_records(log_path, config)
+
+    if not records:
+        logger.info("No undo records found in log file")
+        return 0, 0
+
+    # Apply filters
+    filtered_records = filter_undo_records(
+        records,
+        after=after,
+        before=before,
+        person=person,
+        category=category,
+        max_confidence=max_confidence,
+        min_confidence=min_confidence,
+        file=file,
+        count=count,
+    )
+
+    if not filtered_records:
+        logger.info("No records match the specified filters")
+        return 0, 0
+
+    # Preview
+    print_undo_preview(filtered_records)
+
+    if dry_run:
+        logger.info("DRY RUN — No files will be copied")
+        return len(filtered_records), 0
+
+    # Execute undo
+    success_count = 0
+    failure_count = 0
+    success_records: list[UndoRecord] = []
+    failure_records: list[dict] = []
+
+    for record in filtered_records:
+        source_path = record.destination_path
+        searchable_folder = config.searchable_pdf_folder
+        os.makedirs(searchable_folder, exist_ok=True)
+
+        # Determine the name to use
+        if restore_name:
+            # Use original source filename
+            dest_filename = record.source_file
+        else:
+            # Use the final (suggested) filename
+            dest_filename = record.final_filename
+
+        dest_path = os.path.join(searchable_folder, dest_filename)
+
+        logger.info(
+            "Undoing: %s → %s (from %s)",
+            record.source_file,
+            dest_filename,
+            source_path,
+        )
+
+        # Check if source file exists
+        if not os.path.isfile(source_path):
+            logger.warning(
+                "Source file not found at destination: %s. Skipping.",
+                source_path,
+            )
+            failure_count += 1
+            failure_records.append({
+                "source_file": record.source_file,
+                "error": f"File not found at {source_path}",
+            })
+            continue
+
+        # Copy file to searchable folder
+        try:
+            shutil.copy2(source_path, dest_path)
+            logger.info("Copied to searchable folder: %s", dest_path)
+
+            # Verify copy
+            src_checksum = compute_sha256(source_path)
+            dst_checksum = compute_sha256(dest_path)
+            if src_checksum == dst_checksum:
+                logger.info("Checksum verified for undo: %s", dest_filename)
+                success_count += 1
+                success_records.append(record)
+            else:
+                logger.error(
+                    "Checksum mismatch after undo: %s (src=%s, dst=%s)",
+                    dest_path,
+                    src_checksum,
+                    dst_checksum,
+                )
+                failure_count += 1
+                failure_records.append({
+                    "source_file": record.source_file,
+                    "error": f"Checksum mismatch: src={src_checksum}, dst={dst_checksum}",
+                })
+        except Exception as e:
+            logger.error("Failed to undo %s: %s", record.source_file, e)
+            failure_count += 1
+            failure_records.append({
+                "source_file": record.source_file,
+                "error": str(e),
+            })
+
+    # Write report
+    if success_records or failure_records:
+        write_undo_report(success_records, failure_records, report_dir)
+
+    logger.info(
+        "Undo complete: %d succeeded, %d failed out of %d processed",
+        success_count,
+        failure_count,
+        len(filtered_records),
+    )
+
+    return success_count, failure_count
 
 
 # ── Main processing functions ──────────────────────────────────────────────
@@ -2099,6 +2613,14 @@ def main():
             "Rebuild reports from log file\n"
             "  python pipeline.py --rebuild-from-log --report-dir /path\n"
             "Rebuild to custom directory\n"
+            "  python pipeline.py --undo-from-log                     "
+            "Undo routed files from log\n"
+            "  python pipeline.py --undo-from-log --dry-run           "
+            "Preview undo without copying\n"
+            "  python pipeline.py --undo-from-log --person Eric       "
+            "Undo only Eric's files\n"
+            "  python pipeline.py --undo-from-log --count 50          "
+            "Undo the 50 most recent files\n"
         ),
     )
 
@@ -2146,12 +2668,72 @@ def main():
             "Does not process any files - only parses logs and generates reports."
         ),
     )
+    
+    # Undo from log arguments
+    parser.add_argument(
+        "--undo-from-log",
+        action="store_true",
+        help=(
+            "Undo routed files by parsing the log file. "
+            "Copies files back from their destination to the searchable folder."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview undo operations without actually copying files.",
+    )
+    parser.add_argument(
+        "--after",
+        type=str,
+        help="Only undo files processed after this date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--before",
+        type=str,
+        help="Only undo files processed before this date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--person",
+        type=str,
+        help="Only undo files for this person.",
+    )
+    parser.add_argument(
+        "--category",
+        type=str,
+        help="Only undo files for this category.",
+    )
+    parser.add_argument(
+        "--max-confidence",
+        type=float,
+        help="Only undo files with confidence at or below this value.",
+    )
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        help="Only undo files with confidence at or above this value.",
+    )
+    parser.add_argument(
+        "--file",
+        type=str,
+        help="Only undo this specific file (by original name).",
+    )
+    parser.add_argument(
+        "--restore-name",
+        action="store_true",
+        help="Restore files with their original name (not the suggested name).",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        help="Only undo the N most recent files.",
+    )
 
     args = parser.parse_args()
 
-    # Load configuration early for rebuild mode
+    # Load configuration early for rebuild/undo mode
     config = None
-    if args.rebuild_from_log or args.process or args.process_searchable:
+    if args.rebuild_from_log or args.process or args.process_searchable or args.undo_from_log:
         try:
             config = ConfigManager(args.config)
         except (FileNotFoundError, ValueError) as e:
@@ -2175,6 +2757,46 @@ def main():
                 config=config,
             )
             print(f"Reports rebuilt successfully.")
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+    
+    # Handle undo from log
+    if args.undo_from_log:
+        if config is None:
+            config = ConfigManager(args.config)
+        
+        setup_logging(config)
+        logger = logging.getLogger("pipeline")
+        logger.info("Pipeline started with config: %s", args.config)
+        
+        # Parse date filters
+        after_dt = datetime.strptime(args.after, "%Y-%m-%d") if args.after else None
+        before_dt = datetime.strptime(args.before, "%Y-%m-%d") if args.before else None
+        
+        report_dir = args.report_dir if args.report_dir else ""
+        
+        logger.info("Starting undo from log: dry_run=%s, restore_name=%s, count=%s",
+                    args.dry_run, args.restore_name, args.count)
+        
+        try:
+            success_count, failure_count = undo_from_log(
+                config=config,
+                dry_run=args.dry_run,
+                after=after_dt,
+                before=before_dt,
+                person=args.person,
+                category=args.category,
+                max_confidence=args.max_confidence,
+                min_confidence=args.min_confidence,
+                file=args.file,
+                count=args.count,
+                restore_name=args.restore_name,
+                report_dir=report_dir,
+            )
+            logger.info("Undo complete: %d succeeded, %d failed", success_count, failure_count)
+            print(f"\nUndo complete: {success_count} succeeded, {failure_count} failed")
         except FileNotFoundError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)

@@ -57,6 +57,67 @@
             ],
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Undo from Log",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--undo-from-log"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Undo from Log (Dry Run)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--undo-from-log",
+                "--dry-run"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Undo from Log (Count 50)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--undo-from-log",
+                "--count",
+                "50"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Undo from Log (Person Eric)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--undo-from-log",
+                "--person",
+                "Eric"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Undo from Log (Restore Name)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--undo-from-log",
+                "--restore-name"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ]
 }
