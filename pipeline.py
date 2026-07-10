@@ -2332,6 +2332,340 @@ def process_searchable(
     return success_count
 
 
+# ── Scan admin folder for renaming ──────────────────────────────────────────
+
+
+def scan_admin_folder(
+    config: ConfigManager,
+    simulate: bool = False,
+    reroute: bool = False,
+    report_dir: str = "",
+) -> int:
+    """
+    Scan the entire administrative folder recursively for PDF files whose
+    names match the rename rules (e.g. contain "SCN" or "pdfsam"), run AI
+    classification on each, and rename them to the AI-suggested filename.
+
+    By default, files are renamed in-place (same folder, new name).  With
+    ``reroute=True`` the file is moved to the AI-suggested person/category
+    destination.
+
+    Args:
+        config: Pipeline configuration.
+        simulate: If True, show preview without making any changes.
+        reroute: If True, re-route file to AI-suggested person/category
+                 instead of renaming in-place.
+        report_dir: Directory to write Markdown reports to.  If empty,
+                    reports are not generated.
+
+    Returns:
+        Number of files successfully processed (or simulated).
+    """
+    global _interrupted
+    logger = logging.getLogger("pipeline")
+    admin_root = config.destination_base_folder
+
+    logger.info("Starting scan-admin: scanning %s for SCN/pdfsam files", admin_root)
+
+    if not os.path.isdir(admin_root):
+        logger.error("Administrative folder does not exist: %s", admin_root)
+        return 0
+
+    # ── Initialise OCR engine & AI classifier ─────────────────────────────
+    ocr_engine = OCREngine(config)
+
+    ai_classifier = None
+    try:
+        ai_classifier = AIClassifier(config)
+        logger.info("AI classifier initialized (model: %s)", config.ai_model)
+    except Exception as e:
+        logger.warning(
+            "Failed to initialise AI classifier: %s. Scan cannot proceed.", e
+        )
+        return 0
+
+    # ── Recursively find matching files ────────────────────────────────────
+    matching_files: list[tuple[str, str, str]] = []  # (full_path, dirpath, filename)
+    exclude_folder_name = os.path.basename(config.searchable_pdf_folder)
+
+    for dirpath, dirnames, filenames in os.walk(admin_root):
+        # Skip the searchable / intermediate folder (handled by --process-searchable)
+        if os.path.basename(dirpath) == exclude_folder_name:
+            continue
+
+        for f in filenames:
+            if not f.lower().endswith(".pdf"):
+                continue
+            # Reuse the existing should_rename_file() logic
+            if should_rename_file(f, config):
+                full_path = os.path.join(dirpath, f)
+                matching_files.append((full_path, dirpath, f))
+
+    if not matching_files:
+        logger.info("No matching SCN/pdfsam files found in %s", admin_root)
+        return 0
+
+    logger.info(
+        "Found %d matching file(s) to process in %s",
+        len(matching_files),
+        admin_root,
+    )
+
+    # ── Install SIGINT handler ─────────────────────────────────────────────
+    _interrupted = False
+    original_handler = signal.signal(signal.SIGINT, signal_handler)
+
+    success_count = 0
+    simulation_results: list[dict] = []
+    all_results: list[dict] = []
+    failure_records: list[dict] = []
+
+    for full_path, dirpath, filename in sorted(matching_files, key=lambda x: x[2]):
+        if _interrupted:
+            logger.warning(
+                "Interrupted — stopping before processing %s", filename
+            )
+            break
+
+        logger.info("Processing: %s", filename)
+
+        # ── Text extraction (fast path, no full OCR needed) ────────────────
+        result = ocr_engine.extract_text_direct(full_path)
+        if not result["success"]:
+            logger.error(
+                "Text extraction failed for %s: %s. Skipping.",
+                filename,
+                result["error"],
+            )
+            failure_records.append({
+                "source_file": filename,
+                "failure_reason": "TEXT_EXTRACTION_FAILED",
+                "ai_person": "",
+                "ai_category": "",
+                "ai_filename": "",
+                "confidence": None,
+                "error_details": result.get("error", ""),
+            })
+            continue
+
+        ocr_text = result.get("text", "")
+        page_count = result.get("page_count", 0)
+
+        # ── AI classification ──────────────────────────────────────────────
+        classification = None
+        suggested_filename = None
+
+        if ai_classifier is not None and ocr_text:
+            try:
+                classification = ai_classifier.classify(
+                    ocr_text=ocr_text,
+                    filename=filename,
+                    page_count=page_count,
+                )
+            except Exception as e:
+                logger.error(
+                    "AI classification failed for %s: %s", filename, e,
+                )
+                classification = {"success": False, "error": str(e)}
+
+            if classification and classification.get("success"):
+                person = classification["person"]
+                category = classification["category"]
+                confidence = classification["confidence"]
+                suggested_filename = classification["suggested_filename"]
+
+                logger.info(
+                    "AI classification: person=%s, category=%s, "
+                    "confidence=%.2f, suggested=%s",
+                    person,
+                    category,
+                    confidence,
+                    suggested_filename,
+                )
+
+                # ── Simulation mode ────────────────────────────────────────
+                if simulate:
+                    simulation_results.append(
+                        collect_simulation_row(
+                            source=full_path,
+                            filename=filename,
+                            classification=classification,
+                            config=config,
+                        )
+                    )
+                    success_count += 1
+                    continue
+
+                # ── Determine new filename ─────────────────────────────────
+                new_filename = f"{suggested_filename}.pdf"
+
+                if reroute:
+                    # ── Re-route to AI-suggested destination ─────────────
+                    routing_ok = route_to_destination(
+                        source_path=full_path,
+                        dest_base=config.destination_base_folder,
+                        person=person,
+                        category=category,
+                        filename=new_filename,
+                        config=config,
+                        ai_classifier=ai_classifier,
+                        ocr_text=ocr_text,
+                    )
+
+                    if routing_ok:
+                        dest_path_str = build_destination_path(
+                            config, person, category, new_filename,
+                        )
+                        logger.info(
+                            "Re-routed: %s → %s/%s/%s",
+                            filename,
+                            person,
+                            category,
+                            new_filename,
+                        )
+                        success_count += 1
+                        all_results.append({
+                            "source_file": filename,
+                            "person": person,
+                            "category": category,
+                            "destination_path": dest_path_str,
+                            "final_filename": new_filename,
+                            "confidence": confidence,
+                            "routed_successfully": True,
+                        })
+                    else:
+                        logger.error(
+                            "Re-routing failed for %s. File preserved.",
+                            filename,
+                        )
+                        failure_records.append({
+                            "source_file": filename,
+                            "failure_reason": "ROUTING_FAILED",
+                            "ai_person": person,
+                            "ai_category": category,
+                            "ai_filename": suggested_filename,
+                            "confidence": confidence,
+                            "error_details": "route_to_destination returned False",
+                        })
+                else:
+                    # ── Rename in-place ───────────────────────────────────
+                    new_path = os.path.join(dirpath, new_filename)
+
+                    if os.path.exists(new_path):
+                        logger.warning(
+                            "Destination already exists, skipping rename: %s",
+                            new_path,
+                        )
+                        failure_records.append({
+                            "source_file": filename,
+                            "failure_reason": "RENAME_CONFLICT",
+                            "ai_person": person,
+                            "ai_category": category,
+                            "ai_filename": suggested_filename,
+                            "confidence": confidence,
+                            "error_details": f"Target already exists: {new_path}",
+                        })
+                        continue
+
+                    try:
+                        os.rename(full_path, new_path)
+                        logger.info(
+                            "Renamed in-place: %s → %s (in %s)",
+                            filename,
+                            new_filename,
+                            dirpath,
+                        )
+                        success_count += 1
+                        all_results.append({
+                            "source_file": filename,
+                            "person": person,
+                            "category": category,
+                            "destination_path": new_path,
+                            "final_filename": new_filename,
+                            "confidence": confidence,
+                            "routed_successfully": True,
+                        })
+                    except OSError as e:
+                        logger.error(
+                            "Failed to rename %s: %s", filename, e,
+                        )
+                        failure_records.append({
+                            "source_file": filename,
+                            "failure_reason": "RENAME_FAILED",
+                            "ai_person": person,
+                            "ai_category": category,
+                            "ai_filename": suggested_filename,
+                            "confidence": confidence,
+                            "error_details": str(e),
+                        })
+            else:
+                error_msg = (
+                    classification.get("error", "Unknown error")
+                    if classification
+                    else "No classification result"
+                )
+                logger.warning(
+                    "Classification failed for %s: %s. Skipping.",
+                    filename,
+                    error_msg,
+                )
+                failure_records.append({
+                    "source_file": filename,
+                    "failure_reason": "CLASSIFICATION_FAILED",
+                    "ai_person": classification.get("person", "") if classification else "",
+                    "ai_category": classification.get("category", "") if classification else "",
+                    "ai_filename": classification.get("suggested_filename", "") if classification else "",
+                    "confidence": classification.get("confidence") if classification else None,
+                    "error_details": error_msg,
+                })
+        else:
+            reason = "NO_CLASSIFIER" if ai_classifier is None else "NO_TEXT"
+            logger.warning(
+                "Cannot classify %s: %s. Skipping.",
+                filename,
+                "AI classifier not available" if ai_classifier is None else "No OCR text extracted",
+            )
+            failure_records.append({
+                "source_file": filename,
+                "failure_reason": reason,
+                "ai_person": "",
+                "ai_category": "",
+                "ai_filename": "",
+                "confidence": None,
+                "error_details": "",
+            })
+
+    # ── Print simulation table if in simulation mode ──────────────────────
+    if simulate and simulation_results:
+        print_simulation_table(simulation_results)
+
+    # ── Generate Markdown reports ─────────────────────────────────────────
+    if report_dir:
+        success_path, failure_path = write_reports(
+            all_results, failure_records, config.ai_confidence_threshold, report_dir,
+        )
+        print_report_summary(success_path, failure_path)
+
+    # ── Restore original signal handler ───────────────────────────────────
+    signal.signal(signal.SIGINT, original_handler)
+
+    if _interrupted:
+        logger.warning(
+            "scan-admin interrupted by user. %d succeeded, %d failures.",
+            success_count,
+            len(failure_records),
+        )
+    else:
+        logger.info(
+            "scan-admin complete: %d succeeded, %d failures out of %d found.",
+            success_count,
+            len(failure_records),
+            len(matching_files),
+        )
+
+    return success_count
+
+
 # ── Report rebuild from log ────────────────────────────────────────────────
 
 
@@ -2656,6 +2990,12 @@ def main():
             "Undo only Eric's files\n"
             "  python pipeline.py --undo-from-log --count 50          "
             "Undo the 50 most recent files\n"
+            "  python pipeline.py --scan-admin                        "
+            "Rename SCN/pdfsam files in admin folder (in-place)\n"
+            "  python pipeline.py --scan-admin --simulate             "
+            "Preview renaming without changes\n"
+            "  python pipeline.py --scan-admin --reroute              "
+            "Re-route to AI-suggested destination\n"
         ),
     )
 
@@ -2764,11 +3104,30 @@ def main():
         help="Only undo the N most recent files.",
     )
 
+    # ── Scan admin folder arguments ────────────────────────────────────────
+    parser.add_argument(
+        "--scan-admin",
+        action="store_true",
+        help=(
+            "Scan the entire administrative folder recursively for files "
+            "with SCN or pdfsam names, classify them via AI, and rename "
+            "them to the suggested filename."
+        ),
+    )
+    parser.add_argument(
+        "--reroute",
+        action="store_true",
+        help=(
+            "When used with --scan-admin, re-route files to the AI-suggested "
+            "person/category folder instead of renaming them in-place."
+        ),
+    )
+
     args = parser.parse_args()
 
-    # Load configuration early for rebuild/undo mode
+    # Load configuration early for rebuild/undo / scan-admin mode
     config = None
-    if args.rebuild_from_log or args.process or args.process_searchable or args.undo_from_log:
+    if args.rebuild_from_log or args.process or args.process_searchable or args.undo_from_log or args.scan_admin:
         try:
             config = ConfigManager(args.config)
         except (FileNotFoundError, ValueError) as e:
@@ -2837,7 +3196,41 @@ def main():
             sys.exit(1)
         return
 
-    if not args.process and not args.process_searchable:
+    # ── Handle scan-admin (rename SCN/pdfsam files in admin folder) ──────
+    if args.scan_admin:
+        if config is None:
+            config = ConfigManager(args.config)
+
+        setup_logging(config)
+        logger = logging.getLogger("pipeline")
+        logger.info("Pipeline started with config: %s", args.config)
+
+        if args.simulate:
+            logger.info("SIMULATION MODE — no files will be moved or renamed")
+
+        if args.report_dir:
+            logger.info("Reports will be written to: %s", args.report_dir)
+
+        reroute = args.reroute
+        if reroute:
+            logger.info("REROUTE mode — files will be moved to AI-suggested destination")
+        else:
+            logger.info("RENAME IN-PLACE mode — files will be renamed in their current folder")
+
+        processed = scan_admin_folder(
+            config,
+            simulate=args.simulate,
+            reroute=reroute,
+            report_dir=args.report_dir,
+        )
+
+        if processed == 0:
+            logger.info("No files were processed.")
+        else:
+            logger.info("scan-admin completed: %d file(s) processed successfully.", processed)
+        return
+
+    if not args.process and not args.process_searchable and not args.scan_admin:
         parser.print_help()
         sys.exit(0)
 

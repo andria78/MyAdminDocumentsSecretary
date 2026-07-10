@@ -118,6 +118,41 @@
             ],
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Scan Admin (Rename In-Place)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--scan-admin"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Scan Admin (Simulate)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--scan-admin",
+                "--simulate"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Scan Admin (Reroute)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--scan-admin",
+                "--reroute"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ]
 }
