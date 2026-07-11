@@ -24,6 +24,19 @@ from dataclasses import dataclass, field
 from src.config_manager import ConfigManager
 from src.ocr_engine import OCREngine
 from src.ai_classifier import AIClassifier
+from src.logger import (
+    setup_pipeline_logging,
+    get_logger,
+    TimingContext,
+    ProgressTracker,
+    ANSI,
+    log_start,
+    log_success,
+    log_warning,
+    log_error,
+    log_info,
+    timing,
+)
 
 
 # ── Global interrupt flag for graceful Ctrl+C handling ──────────────────────
@@ -51,22 +64,37 @@ def signal_handler(sig, frame):
 
 
 def setup_logging(config: ConfigManager) -> None:
-    """Configure logging based on pipeline config."""
-    log_level = getattr(logging, config.logging_level.upper(), logging.INFO)
+    """Configure logging based on pipeline config with enhanced terminal output.
+    
+    Uses the enhanced logger module for rich terminal output with:
+    - Emoji indicators for different operation types
+    - ANSI color codes for log levels (green=INFO, yellow=WARNING, red=ERROR)
+    - Timestamps for all entries
+    - Timing context for operation durations
+    
+    The terminal output shows:
+    - 🚀 Starting operations
+    - ✅ Completed operations with timing
+    - 📄 File processing
+    - 🤖 AI classification
+    - 📦 File routing
+    - 🗑️ Deletion operations
+    - 📁 Sub-folder detection
+    - 🏷️ Filename changes
+    - 🔐 Checksum verification
+    
+    The log file contains:
+    - Standard format with full details
+    - All log levels (DEBUG, INFO, WARNING, ERROR)
+    """
     log_file = config.logging_file
 
-    # Ensure log directory exists
-    log_dir = os.path.dirname(log_file)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+    # Use enhanced pipeline logging (pass string level, not int)
+    setup_pipeline_logging(
+        log_level=config.logging_level,
+        log_file=log_file,
+        enable_colors=True,
+        enable_timing=True,
     )
 
 
@@ -1430,6 +1458,130 @@ def undo_from_log(
     return success_count, failure_count
 
 
+# ── Enhanced logging helpers ──────────────────────────────────────────────
+
+
+class TimingContext:
+    """Context manager for timing operations with automatic logging.
+    
+    Usage:
+        with TimingContext(logger, "Processing files"):
+            # do work
+        # Logs: "⏱️ [INFO] pipeline: Processing files completed in 1.234s"
+    """
+    
+    def __init__(self, logger: logging.Logger, operation: str):
+        """Initialize timing context.
+        
+        Args:
+            logger: Logger instance to use for output.
+            operation: Name of the operation being timed.
+        """
+        self.logger = logger
+        self.operation = operation
+        self.start_time = None
+        
+    def __enter__(self):
+        """Start timing."""
+        self.start_time = datetime.now()
+        self.logger.info("⏱️ Starting: %s", self.operation)
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Stop timing and log duration."""
+        end_time = datetime.now()
+        duration = (end_time - self.start_time).total_seconds()
+        if exc_type is None:
+            self.logger.info("⏱️ Completed: %s in %.3fs", self.operation, duration)
+        else:
+            self.logger.warning("⏱️ Completed with error: %s in %.3fs (%s: %s)",
+                              self.operation, duration, exc_type.__name__, exc_val)
+        return False
+
+
+def _format_log_message(level: str, logger_name: str, message: str) -> str:
+    """Format a log message with enhanced visual indicators for terminal output.
+    
+    Args:
+        level: Log level (INFO, WARNING, ERROR, etc.)
+        logger_name: Logger name (typically "pipeline")
+        message: Log message
+        
+    Returns:
+        Formatted string with emojis and visual indicators.
+    """
+    # Emoji mapping for different log levels and message patterns
+    emoji = ""
+    
+    if level == "INFO":
+        if "Processing:" in message:
+            emoji = "🔄"
+        elif "AI classification:" in message:
+            emoji = "🤖"
+        elif "Copied to:" in message or "routed to:" in message.lower():
+            emoji = "📦"
+        elif "Deleted" in message:
+            emoji = "🗑️"
+        elif "Simulation:" in message:
+            emoji = "🔍"
+        elif "Found" in message and "PDF" in message:
+            emoji = "📄"
+        elif "Processing cycle complete" in message:
+            emoji = "✅"
+        elif "Sub-folder" in message:
+            emoji = "📁"
+        elif "AI classifier initialized" in message:
+            emoji = "🧠"
+        elif "Simulation" in message or "SIMULATION" in message:
+            emoji = "⚙️"
+        elif "RENAME" in message or "rename" in message:
+            emoji = "🏷️"
+        else:
+            emoji = "ℹ️"
+    elif level == "WARNING":
+        emoji = "⚠️"
+    elif level == "ERROR":
+        emoji = "❌"
+    elif level == "DEBUG":
+        emoji = "🔬"
+    
+    return f"{emoji} [{level:>5}] {logger_name}: {message}"
+
+
+class EnhancedStreamHandler(logging.StreamHandler):
+    """Custom StreamHandler that provides enhanced visual feedback in terminal.
+    
+    This handler formats log messages with emojis and visual indicators
+    to make it easier to track pipeline progress in real-time.
+    """
+    
+    def emit(self, record):
+        """Emit a log record with enhanced formatting."""
+        try:
+            msg = self.format(record)
+            # Add color codes for different levels (ANSI colors)
+            level_num = record.levelno
+            if level_num >= 50:  # ERROR
+                color_code = "\033[91m"  # Red
+            elif level_num >= 40:  # WARNING
+                color_code = "\033[93m"  # Yellow
+            elif level_num >= 30:  # INFO
+                color_code = "\033[92m"  # Green
+            else:  # DEBUG
+                color_code = "\033[96m"  # Cyan
+            
+            # Reset code
+            reset_code = "\033[0m"
+            
+            # Write formatted message
+            formatted_msg = f"{color_code}{msg}{reset_code}"
+            stream = self.stream
+            stream.write(formatted_msg + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 # ── Main processing functions ──────────────────────────────────────────────
 
 
@@ -2362,33 +2514,41 @@ def scan_admin_folder(
         Number of files successfully processed (or simulated).
     """
     global _interrupted
-    logger = logging.getLogger("pipeline")
+    logger = get_logger("pipeline")
     admin_root = config.destination_base_folder
 
-    logger.info("Starting scan-admin: scanning %s for SCN/pdfsam files", admin_root)
+    # Log scan start with enhanced formatting
+    logger.info("🚀 Starting scan-admin: scanning %s for SCN/pdfsam files", admin_root)
+    logger.info("📂 Admin root: %s", admin_root)
+    logger.info("📋 Configuration: simulate=%s, reroute=%s", simulate, reroute)
 
     if not os.path.isdir(admin_root):
-        logger.error("Administrative folder does not exist: %s", admin_root)
+        logger.error("❌ Administrative folder does not exist: %s", admin_root)
         return 0
 
     # ── Initialise OCR engine & AI classifier ─────────────────────────────
+    logger.info("📝 Initializing OCR engine...")
     ocr_engine = OCREngine(config)
 
+    logger.info("🧠 Initializing AI classifier...")
     ai_classifier = None
     try:
         ai_classifier = AIClassifier(config)
-        logger.info("AI classifier initialized (model: %s)", config.ai_model)
+        logger.info("✅ AI classifier initialized (model: %s)", config.ai_model)
     except Exception as e:
         logger.warning(
-            "Failed to initialise AI classifier: %s. Scan cannot proceed.", e
+            "⚠️  Failed to initialise AI classifier: %s. Scan cannot proceed.", e
         )
         return 0
 
     # ── Recursively find matching files ────────────────────────────────────
+    logger.info("🔍 Scanning recursively for matching PDF files...")
     matching_files: list[tuple[str, str, str]] = []  # (full_path, dirpath, filename)
     exclude_folder_name = os.path.basename(config.searchable_pdf_folder)
+    scanned_dirs = 0
 
     for dirpath, dirnames, filenames in os.walk(admin_root):
+        scanned_dirs += 1
         # Skip the searchable / intermediate folder (handled by --process-searchable)
         if os.path.basename(dirpath) == exclude_folder_name:
             continue
@@ -2401,12 +2561,14 @@ def scan_admin_folder(
                 full_path = os.path.join(dirpath, f)
                 matching_files.append((full_path, dirpath, f))
 
+    logger.info("📁 Scanned %d directories, found %d matching file(s)", scanned_dirs, len(matching_files))
+
     if not matching_files:
-        logger.info("No matching SCN/pdfsam files found in %s", admin_root)
+        logger.info("ℹ️  No matching SCN/pdfsam files found in %s", admin_root)
         return 0
 
     logger.info(
-        "Found %d matching file(s) to process in %s",
+        "📄 Found %d matching file(s) to process in %s",
         len(matching_files),
         admin_root,
     )
@@ -2419,15 +2581,21 @@ def scan_admin_folder(
     simulation_results: list[dict] = []
     all_results: list[dict] = []
     failure_records: list[dict] = []
+    
+    # Create progress tracker
+    total_files = len(matching_files)
+    tracker = ProgressTracker(total=total_files, description="Processing files")
 
     for full_path, dirpath, filename in sorted(matching_files, key=lambda x: x[2]):
         if _interrupted:
             logger.warning(
-                "Interrupted — stopping before processing %s", filename
+                "⏹️  Interrupted — stopping before processing %s", filename
             )
             break
 
-        logger.info("Processing: %s", filename)
+        # Log file processing with enhanced formatting
+        logger.info("🔄 Processing: %s", filename)
+        logger.debug("   📂 Location: %s", full_path)
 
         # ── Text extraction (fast path, no full OCR needed) ────────────────
         result = ocr_engine.extract_text_direct(full_path)
@@ -2634,16 +2802,29 @@ def scan_admin_folder(
                 "confidence": None,
                 "error_details": "",
             })
+        
+        # Update progress tracker
+        status = "✅" if success_count > 0 and failure_records else "⏳"
+        tracker.update(message=f"{status} {filename}")
 
     # ── Print simulation table if in simulation mode ──────────────────────
     if simulate and simulation_results:
         print_simulation_table(simulation_results)
+    
+    # Update progress tracker to complete
+    if not _interrupted:
+        tracker.complete(message=f"{success_count} succeeded, {len(failure_records)} failed")
+    else:
+        tracker.update(message="Interrupted")
 
     # ── Generate Markdown reports ─────────────────────────────────────────
     if report_dir:
+        logger.info("📝 Generating Markdown reports...")
         success_path, failure_path = write_reports(
             all_results, failure_records, config.ai_confidence_threshold, report_dir,
         )
+        logger.info("📄 Success report: %s", success_path)
+        logger.info("📄 Failure report: %s", failure_path)
         print_report_summary(success_path, failure_path)
 
     # ── Restore original signal handler ───────────────────────────────────
@@ -2651,13 +2832,13 @@ def scan_admin_folder(
 
     if _interrupted:
         logger.warning(
-            "scan-admin interrupted by user. %d succeeded, %d failures.",
+            "⏹️  scan-admin interrupted by user. %d succeeded, %d failures.",
             success_count,
             len(failure_records),
         )
     else:
         logger.info(
-            "scan-admin complete: %d succeeded, %d failures out of %d found.",
+            "✅ scan-admin complete: %d succeeded, %d failures out of %d found.",
             success_count,
             len(failure_records),
             len(matching_files),
@@ -3201,33 +3382,37 @@ def main():
         if config is None:
             config = ConfigManager(args.config)
 
+        # Use enhanced logging with detailed output
         setup_logging(config)
-        logger = logging.getLogger("pipeline")
-        logger.info("Pipeline started with config: %s", args.config)
+        logger = get_logger("pipeline")
+        logger.info("🚀 Pipeline started with config: %s", args.config)
+        logger.info("📋 Log level: %s | Log file: %s", config.logging_level, config.logging_file)
 
         if args.simulate:
-            logger.info("SIMULATION MODE — no files will be moved or renamed")
+            logger.info("⚙️  SIMULATION MODE — no files will be moved or renamed")
 
         if args.report_dir:
-            logger.info("Reports will be written to: %s", args.report_dir)
+            logger.info("📁 Reports will be written to: %s", args.report_dir)
 
         reroute = args.reroute
         if reroute:
-            logger.info("REROUTE mode — files will be moved to AI-suggested destination")
+            logger.info("🔀 REROUTE mode — files will be moved to AI-suggested destination")
         else:
-            logger.info("RENAME IN-PLACE mode — files will be renamed in their current folder")
+            logger.info("🏷️  RENAME IN-PLACE mode — files will be renamed in their current folder")
 
-        processed = scan_admin_folder(
-            config,
-            simulate=args.simulate,
-            reroute=reroute,
-            report_dir=args.report_dir,
-        )
+        # Start timing the scan-admin operation
+        with TimingContext(logger, "scan-admin operation"):
+            processed = scan_admin_folder(
+                config,
+                simulate=args.simulate,
+                reroute=reroute,
+                report_dir=args.report_dir,
+            )
 
         if processed == 0:
-            logger.info("No files were processed.")
+            logger.info("ℹ️  No files were processed.")
         else:
-            logger.info("scan-admin completed: %d file(s) processed successfully.", processed)
+            logger.info("✅ scan-admin completed: %d file(s) processed successfully.", processed)
         return
 
     if not args.process and not args.process_searchable and not args.scan_admin:
@@ -3238,38 +3423,40 @@ def main():
     if config is not None:
         setup_logging(config)
 
-        logger = logging.getLogger("pipeline")
-        logger.info("Pipeline started with config: %s", args.config)
+        logger = get_logger("pipeline")
+        logger.info("🚀 Pipeline started with config: %s", args.config)
+        logger.info("📋 Log level: %s | Log file: %s", config.logging_level, config.logging_file)
 
         if args.simulate:
-            logger.info("SIMULATION MODE — no files will be moved or deleted")
+            logger.info("⚙️  SIMULATION MODE — no files will be moved or deleted")
 
         if args.report_dir:
-            logger.info("Reports will be written to: %s", args.report_dir)
+            logger.info("📁 Reports will be written to: %s", args.report_dir)
 
-        # Process files
-        processed = 0
-        if args.process_searchable:
-            processed = process_searchable(
-                config, simulate=args.simulate, report_dir=args.report_dir
-            )
-        elif args.process:
-            processed = process_all(
-                config, simulate=args.simulate, report_dir=args.report_dir
-            )
+        # Process files with timing
+        with TimingContext(logger, "file processing"):
+            processed = 0
+            if args.process_searchable:
+                processed = process_searchable(
+                    config, simulate=args.simulate, report_dir=args.report_dir
+                )
+            elif args.process:
+                processed = process_all(
+                    config, simulate=args.simulate, report_dir=args.report_dir
+                )
 
         if processed == 0:
-            logger.info("No files were processed.")
+            logger.info("ℹ️  No files were processed.")
         else:
-            logger.info("Pipeline completed: %d file(s) processed successfully.", processed)
+            logger.info("✅ Pipeline completed: %d file(s) processed successfully.", processed)
     else:
         print("Error: Configuration not available for processing.", file=sys.stderr)
         sys.exit(1)
 
     if processed == 0:
-        logger.info("No files were processed.")
+        logger.info("ℹ️  No files were processed.")
     else:
-        logger.info("Pipeline completed: %d file(s) processed successfully.", processed)
+        logger.info("✅ Pipeline completed: %d file(s) processed successfully.", processed)
 
 
 if __name__ == "__main__":
