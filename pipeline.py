@@ -2545,13 +2545,21 @@ def scan_admin_folder(
     logger.info("🔍 Scanning recursively for matching PDF files...")
     matching_files: list[tuple[str, str, str]] = []  # (full_path, dirpath, filename)
     exclude_folder_name = os.path.basename(config.searchable_pdf_folder)
+
+    # Folders to skip entirely (system/trash folders that slow down the scan)
+    skip_folders = {"#recycle", "#snapshot", ".Trashes", ".Spotlight-V100", ".fseventsd"}
+
     scanned_dirs = 0
 
     for dirpath, dirnames, filenames in os.walk(admin_root):
-        scanned_dirs += 1
+        # Prune the walk: skip system/trash folders entirely (do not descend into them)
+        dirnames[:] = [d for d in dirnames if d not in skip_folders]
+
         # Skip the searchable / intermediate folder (handled by --process-searchable)
         if os.path.basename(dirpath) == exclude_folder_name:
             continue
+
+        scanned_dirs += 1
 
         for f in filenames:
             if not f.lower().endswith(".pdf"):

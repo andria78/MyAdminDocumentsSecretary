@@ -98,10 +98,23 @@ class OCREngine:
             os.makedirs(output_dir, exist_ok=True)
 
         try:
-            doc.save(output_path, incremental=False, deflate=True)
-            logger.info("Saved searchable PDF: %s", output_path)
+            if output_path == pdf_path:
+                # Saving to the same file: use a temporary file, then replace
+                temp_path = pdf_path + ".ocr_tmp"
+                doc.save(temp_path, incremental=False, deflate=True)
+                doc.close()
+                os.replace(temp_path, pdf_path)
+                logger.info("Saved searchable PDF (in-place): %s", pdf_path)
+            else:
+                doc.save(output_path, incremental=False, deflate=True)
+                logger.info("Saved searchable PDF: %s", output_path)
         except Exception as e:
             doc.close()
+            # Clean up temp file if it exists
+            if output_path == pdf_path:
+                temp_path = pdf_path + ".ocr_tmp"
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
             return {
                 "success": False,
                 "text": full_text,
