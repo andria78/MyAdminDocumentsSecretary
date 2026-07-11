@@ -2961,6 +2961,152 @@ def scan_admin_folder(
     return success_count
 
 
+# ── Deduplicate admin folder ────────────────────────────────────────────────
+
+
+def deduplicate_admin_folder(
+    config: ConfigManager,
+    simulate: bool = False,
+) -> int:
+    """
+    Scan the entire administrative folder for duplicate PDF files by SHA-256
+    checksum.  When a duplicate pair is found where one file has an SCN/pdfsam
+    name (the original that was not deleted after reroute) and the other has a
+    descriptive AI-renamed name, the original SCN/pdfsam file is deleted.
+
+    This cleans up duplicates left behind by earlier ``--scan-admin --reroute``
+    runs that copied files to their new destination but did not delete the
+    original (before the deletion fix was implemented).
+
+    Args:
+        config: Pipeline configuration.
+        simulate: If True, show what would be deleted without actually deleting.
+
+    Returns:
+        Number of duplicate originals deleted (or simulated).
+    """
+    logger = get_logger("pipeline")
+    admin_root = config.destination_base_folder
+
+    logger.info("🚀 Starting deduplicate: scanning %s for duplicate PDFs by SHA-256", admin_root)
+    logger.info("📋 Configuration: simulate=%s", simulate)
+
+    if not os.path.isdir(admin_root):
+        logger.error("❌ Administrative folder does not exist: %s", admin_root)
+        return 0
+
+    # ── Walk the admin folder and compute checksums ──────────────────────────
+    logger.info("🔍 Walking admin folder and computing SHA-256 checksums...")
+    skip_folders = {"#recycle", "#snapshot", ".Trashes", ".Spotlight-V100", ".fseventsd"}
+
+    checksum_map: dict[str, list[str]] = {}  # checksum -> list of file paths
+    total_pdfs = 0
+
+    for dirpath, dirnames, filenames in os.walk(admin_root):
+        # Prune system/trash folders
+        dirnames[:] = [d for d in dirnames if d not in skip_folders]
+
+        for f in filenames:
+            if not f.lower().endswith(".pdf"):
+                continue
+            full_path = os.path.join(dirpath, f)
+            try:
+                cksum = compute_sha256(full_path)
+            except Exception as e:
+                logger.warning("⚠️  Could not read %s: %s. Skipping.", full_path, e)
+                continue
+
+            checksum_map.setdefault(cksum, []).append(full_path)
+            total_pdfs += 1
+
+    logger.info("📄 Scanned %d PDF files total", total_pdfs)
+
+    # ── Find duplicate groups ────────────────────────────────────────────────
+    duplicate_groups = {cksum: paths for cksum, paths in checksum_map.items() if len(paths) > 1}
+
+    if not duplicate_groups:
+        logger.info("✅ No duplicate PDF files found in %s", admin_root)
+        print("\n  ✅ No duplicate PDF files found.\n")
+        return 0
+
+    logger.info("🔁 Found %d duplicate groups (files with identical checksums)", len(duplicate_groups))
+
+    # ── Process each duplicate group ─────────────────────────────────────────
+    deleted_count = 0
+    skipped_count = 0
+    simulated_count = 0
+
+    print()
+    print("=" * 120)
+    print("  DEDUPLICATION RESULTS")
+    print("=" * 120)
+
+    for cksum, paths in sorted(duplicate_groups.items()):
+        # Separate SCN/pdfsam files (originals) from descriptive names (rerouted copies)
+        scn_files = [p for p in paths if should_rename_file(os.path.basename(p), config)]
+        non_scn_files = [p for p in paths if not should_rename_file(os.path.basename(p), config)]
+
+        if len(scn_files) == 0 or len(non_scn_files) == 0:
+            # No clear original vs copy distinction — skip
+            skipped_count += 1
+            logger.debug(
+                "Skipping duplicate group (no clear SCN/non-SCN split): %s",
+                paths,
+            )
+            continue
+
+        # Delete all SCN/pdfsam files in this group (keep the rerouted copies)
+        for scn_path in scn_files:
+            if simulate:
+                logger.info(
+                    "🔍 [SIMULATE] Would delete original: %s (kept as: %s)",
+                    scn_path,
+                    ", ".join(non_scn_files),
+                )
+                simulated_count += 1
+            else:
+                try:
+                    os.remove(scn_path)
+                    logger.info(
+                        "🗑️  Deleted duplicate original: %s (kept as: %s)",
+                        scn_path,
+                        ", ".join(non_scn_files),
+                    )
+                    deleted_count += 1
+                except OSError as e:
+                    logger.error(
+                        "❌ Failed to delete %s: %s", scn_path, e,
+                    )
+
+    # ── Print summary ────────────────────────────────────────────────────────
+    total_duplicates = sum(len(paths) - 1 for paths in duplicate_groups.values())
+    print()
+    print(f"  Total duplicate groups found:  {len(duplicate_groups)}")
+    print(f"  Total duplicate files (extra): {total_duplicates}")
+    if simulate:
+        print(f"  Simulated deletions:          {simulated_count}")
+    else:
+        print(f"  Deleted original files:       {deleted_count}")
+    print(f"  Skipped groups (no clear SCN): {skipped_count}")
+    print()
+
+    if simulate:
+        logger.info(
+            "🔍 deduplicate simulation complete: %d files would be deleted, "
+            "%d groups skipped (no clear original vs copy)",
+            simulated_count,
+            skipped_count,
+        )
+    else:
+        logger.info(
+            "✅ deduplicate complete: %d files deleted, %d groups skipped",
+            deleted_count,
+            skipped_count,
+        )
+
+    return deleted_count if not simulate else simulated_count
+
+
 # ── Report rebuild from log ────────────────────────────────────────────────
 
 
@@ -3291,6 +3437,10 @@ def main():
             "Preview renaming without changes\n"
             "  python pipeline.py --scan-admin --reroute              "
             "Re-route to AI-suggested destination\n"
+            "  python pipeline.py --deduplicate                        "
+            "Remove duplicate PDFs by SHA-256 checksum\n"
+            "  python pipeline.py --deduplicate --simulate             "
+            "Preview duplicates without deleting\n"
         ),
     )
 
@@ -3417,12 +3567,21 @@ def main():
             "person/category folder instead of renaming them in-place."
         ),
     )
+    parser.add_argument(
+        "--deduplicate",
+        action="store_true",
+        help=(
+            "Scan the entire administrative folder for duplicate PDF files "
+            "by SHA-256 checksum and remove originals (SCN/pdfsam files) "
+            "that were left behind after rerouting."
+        ),
+    )
 
     args = parser.parse_args()
 
-    # Load configuration early for rebuild/undo / scan-admin mode
+    # Load configuration early for rebuild/undo / scan-admin / deduplicate mode
     config = None
-    if args.rebuild_from_log or args.process or args.process_searchable or args.undo_from_log or args.scan_admin:
+    if args.rebuild_from_log or args.process or args.process_searchable or args.undo_from_log or args.scan_admin or args.deduplicate:
         try:
             config = ConfigManager(args.config)
         except (FileNotFoundError, ValueError) as e:
@@ -3491,6 +3650,32 @@ def main():
             sys.exit(1)
         return
 
+    # ── Handle deduplicate (remove duplicate PDFs by SHA-256) ────────────
+    if args.deduplicate:
+        if config is None:
+            config = ConfigManager(args.config)
+
+        setup_logging(config)
+        logger = get_logger("pipeline")
+        logger.info("🚀 Pipeline started with config: %s", args.config)
+        logger.info("📋 Log level: %s | Log file: %s", config.logging_level, config.logging_file)
+
+        if args.simulate:
+            logger.info("⚙️  SIMULATION MODE — no files will be deleted")
+
+        # Start timing
+        with TimingContext(logger, "deduplicate operation"):
+            processed = deduplicate_admin_folder(
+                config,
+                simulate=args.simulate,
+            )
+
+        if processed == 0:
+            logger.info("ℹ️  No duplicate files were processed.")
+        else:
+            logger.info("✅ deduplicate completed: %d file(s) processed.", processed)
+        return
+
     # ── Handle scan-admin (rename SCN/pdfsam files in admin folder) ──────
     if args.scan_admin:
         if config is None:
@@ -3529,7 +3714,7 @@ def main():
             logger.info("✅ scan-admin completed: %d file(s) processed successfully.", processed)
         return
 
-    if not args.process and not args.process_searchable and not args.scan_admin:
+    if not args.process and not args.process_searchable and not args.scan_admin and not args.deduplicate:
         parser.print_help()
         sys.exit(0)
 
