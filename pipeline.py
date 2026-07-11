@@ -224,6 +224,66 @@ def scan_category_sub_folders(
     ])
 
 
+def extract_person_from_path(
+    file_path: str,
+    hierarchy: dict,
+    dest_base: str,
+) -> str | None:
+    """
+    Check if a file is already inside a known person's folder.
+
+    Walks up the directory tree from the file's location, checking if any
+    parent directory matches a person folder name (prefix + person name)
+    from the person_categories hierarchy.
+
+    For example, if ``dest_base`` is ``/Volumes/Administratif`` and the
+    file is at ``/Volumes/Administratif/30-Eric/20-Achats/Facture.pdf``,
+    then ``30-Eric`` matches person ``Eric`` (prefix ``30-``), so this
+    function returns ``"Eric"``.
+
+    Args:
+        file_path: Full path to the file.
+        hierarchy: Person hierarchy dict from ``load_person_categories()``.
+        dest_base: Base destination folder (e.g. ``/Volumes/Administratif``).
+
+    Returns:
+        Person name (e.g. ``"Eric"``) if the file is inside a known person
+        folder, or ``None`` if no known person folder is found in the path.
+    """
+    logger = logging.getLogger("pipeline")
+
+    # Build a mapping: lowercase folder_name -> person name
+    # e.g. "30-eric" -> "Eric", "40-sophie" -> "Sophie"
+    person_folders: dict[str, str] = {}
+    for p in hierarchy.get("people", []):
+        folder_name = f"{p.get('prefix', '')}{p['name']}"
+        person_folders[folder_name.lower()] = p["name"]
+
+    # Walk up from the file's directory toward dest_base
+    dirpath = os.path.dirname(file_path)
+
+    # Resolve to absolute, normalized paths
+    dirpath = os.path.realpath(dirpath)
+    dest_base_resolved = os.path.realpath(dest_base)
+
+    current = dirpath
+    while current and len(current) >= len(dest_base_resolved):
+        basename = os.path.basename(current)
+        if basename.lower() in person_folders:
+            person = person_folders[basename.lower()]
+            logger.debug(
+                "Person folder '%s' detected in path → person='%s'", basename, person,
+            )
+            return person
+        # Move up one directory level
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    return None
+
+
 def route_to_destination(
     source_path: str,
     dest_base: str,
@@ -2544,7 +2604,7 @@ def scan_admin_folder(
     # ── Recursively find matching files ────────────────────────────────────
     logger.info("🔍 Scanning recursively for matching PDF files...")
     matching_files: list[tuple[str, str, str]] = []  # (full_path, dirpath, filename)
-    exclude_folder_name = os.path.basename(config.searchable_pdf_folder)
+    searchable_folder = config.searchable_pdf_folder
 
     # Folders to skip entirely (system/trash folders that slow down the scan)
     skip_folders = {"#recycle", "#snapshot", ".Trashes", ".Spotlight-V100", ".fseventsd"}
@@ -2555,8 +2615,9 @@ def scan_admin_folder(
         # Prune the walk: skip system/trash folders entirely (do not descend into them)
         dirnames[:] = [d for d in dirnames if d not in skip_folders]
 
-        # Skip the searchable / intermediate folder (handled by --process-searchable)
-        if os.path.basename(dirpath) == exclude_folder_name:
+        # Skip only the root searchable / intermediate folder (handled by --process-searchable)
+        # Do NOT skip person-level 00-ScansNonTries subfolders (e.g. 30-Eric/00-ScansNonTries)
+        if dirpath == searchable_folder:
             continue
 
         scanned_dirs += 1
@@ -2632,12 +2693,42 @@ def scan_admin_folder(
         suggested_filename = None
 
         if ai_classifier is not None and ocr_text:
-            try:
-                classification = ai_classifier.classify(
-                    ocr_text=ocr_text,
-                    filename=filename,
-                    page_count=page_count,
+            # Check if we should preserve the person (reroute + file in person folder)
+            preserved_person = None
+            if reroute:
+                hierarchy = config.load_person_categories()
+                preserved_person = extract_person_from_path(
+                    full_path, hierarchy, config.destination_base_folder,
                 )
+
+            try:
+                if preserved_person:
+                    # Person is known from folder path — only classify category
+                    logger.info(
+                        "👤 Person '%s' detected from folder path. "
+                        "Classifying category only.",
+                        preserved_person,
+                    )
+                    classification = ai_classifier.classify_category_only(
+                        ocr_text=ocr_text,
+                        filename=filename,
+                        page_count=page_count,
+                        person=preserved_person,
+                    )
+                else:
+                    # Full classification (person + category)
+                    if not reroute:
+                        logger.debug("Using full classification (in-place rename mode).")
+                    elif preserved_person is None:
+                        logger.info(
+                            "File not inside a known person folder. "
+                            "Using full classification.",
+                        )
+                    classification = ai_classifier.classify(
+                        ocr_text=ocr_text,
+                        filename=filename,
+                        page_count=page_count,
+                    )
             except Exception as e:
                 logger.error(
                     "AI classification failed for %s: %s", filename, e,

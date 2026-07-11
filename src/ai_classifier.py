@@ -251,6 +251,127 @@ class AIClassifier:
             "error": None,
         }
 
+    def classify_category_only(
+        self,
+        ocr_text: str,
+        filename: str,
+        page_count: int,
+        person: str,
+    ) -> dict:
+        """
+        Classify only the category for a document, given a known person.
+
+        Unlike :meth:`classify`, this method does NOT determine the person —
+        it only determines the best category and suggested filename for the
+        given person.
+
+        Args:
+            ocr_text: Full OCR-extracted text.
+            filename: Original filename (for context).
+            page_count: Number of pages in the document.
+            person: Known person name (e.g. ``"Eric"``).
+
+        Returns:
+            dict with:
+                - success: bool
+                - person: str (the same as the input ``person``)
+                - category: str (e.g. ``"20-Achats&Fournisseurs"``)
+                - suggested_filename: str
+                - confidence: float (0.0–1.0)
+                - reasoning: str
+                - error: str (if failed)
+        """
+        # Validate that the person exists in the hierarchy
+        person_lower = person.lower()
+        person_entry = None
+        for p in self._hierarchy.get("people", []):
+            if p["name"].lower() == person_lower:
+                person_entry = p
+                break
+
+        if not person_entry:
+            return {
+                "success": False,
+                "person": person,
+                "category": "",
+                "suggested_filename": "",
+                "confidence": 0.0,
+                "reasoning": "",
+                "error": f"Person '{person}' not found in hierarchy",
+            }
+
+        # Build a category-only prompt
+        categories_list = ", ".join(person_entry.get("categories", []))
+        prompt = self._build_category_only_prompt(
+            ocr_text, filename, page_count, person, categories_list,
+        )
+
+        # Call Ollama
+        raw_response = self._call_ollama(prompt, max_tokens=self._max_tokens)
+        if not raw_response.get("success"):
+            return {
+                "success": False,
+                "person": person,
+                "category": "",
+                "suggested_filename": "",
+                "confidence": 0.0,
+                "reasoning": "",
+                "error": raw_response.get("error", "Ollama call failed"),
+            }
+
+        # Parse response (reuse existing JSON parser, then override person)
+        result = self._parse_category_only_response(raw_response["response"])
+        if not result.get("success"):
+            return {
+                "success": False,
+                "person": person,
+                "category": "",
+                "suggested_filename": "",
+                "confidence": 0.0,
+                "reasoning": "",
+                "error": result.get("error", "Failed to parse AI response"),
+            }
+
+        # Validate that the chosen category is valid for this person
+        category = result.get("category", "")
+        if not any(
+            c.lower() == category.lower()
+            for c in person_entry.get("categories", [])
+        ):
+            logger.warning(
+                "AI returned invalid category '%s' for person '%s'. Valid: %s",
+                category,
+                person,
+                categories_list,
+            )
+            return {
+                "success": False,
+                "person": person,
+                "category": category,
+                "suggested_filename": result.get("suggested_filename", ""),
+                "confidence": result.get("confidence", 0.0),
+                "reasoning": result.get("reasoning", ""),
+                "error": f"Invalid category '{category}' for person '{person}'",
+            }
+
+        # Sanitize suggested filename
+        suggested_filename = self._sanitize_filename(
+            result.get("suggested_filename", ""),
+        )
+
+        confidence = float(result.get("confidence", 0.0))
+        confidence = max(0.0, min(1.0, confidence))
+
+        return {
+            "success": True,
+            "person": person,  # Force the known person
+            "category": category,
+            "suggested_filename": suggested_filename,
+            "confidence": confidence,
+            "reasoning": result.get("reasoning", ""),
+            "error": None,
+        }
+
     # ── Prompt builders ─────────────────────────────────────────────────────
 
     def _build_prompt(self, ocr_text: str, filename: str, page_count: int) -> str:
@@ -371,8 +492,132 @@ class AIClassifier:
         )
         return prompt
 
-    # ── Ollama API call ─────────────────────────────────────────────────────
+    def _build_category_only_prompt(
+        self,
+        ocr_text: str,
+        filename: str,
+        page_count: int,
+        person: str,
+        categories_list: str,
+    ) -> str:
+        """Construct a prompt that fixes the person and only asks for category + filename."""
+        prompt = (
+            "You are a document classification assistant for an administrative "
+            "document management system.\n\n"
+            f"Document details:\n"
+            f"- Filename: {filename}\n"
+            f"- Page count: {page_count}\n"
+            f"- OCR Text:\n"
+            f"---\n"
+            f"{ocr_text}\n"
+            f"---\n\n"
+            f"The person this document belongs to is ALREADY KNOWN: {person}.\n\n"
+            f"Available categories for {person}:\n"
+            f"{categories_list}\n\n"
+            f"CRITICAL: You MUST choose a category EXACTLY from the list above. "
+            f"Do NOT invent new categories.\n\n"
+            f"Rules for determining the category:\n"
+            f"- Pay slips, salary statements, payroll documents → 40-ActiviteProf "
+            f"(professional activity), NOT 90-Financier.\n"
+            f"- Software licenses, SaaS subscriptions, digital products, IT purchases → "
+            f"70-Digital, NOT 20-Achats&Fournisseurs.\n"
+            f"- Utility bills (electricity, gas, water, waste disposal) → "
+            f"20-Achats&Fournisseurs (suppliers/purchases), NOT 90-Financier.\n"
+            f"- Medical invoices, pharmacy receipts, doctor bills → 80-Sante (health), "
+            f"NOT 20-Achats&Fournisseurs.\n"
+            f"- Bank statements, investment reports, loan documents → 90-Financier.\n"
+            f"- Invoices for physical goods (hardware, office supplies, furniture) → "
+            f"20-Achats&Fournisseurs.\n"
+            f"- Official documents (passports, IDs, birth certificates, school "
+            f"certificates) → 10-DocumentsOfficiels.\n\n"
+            f"Tasks:\n"
+            f"1. Choose the most appropriate category from the list above for this document.\n"
+            f"2. Suggest a descriptive, detailed filename (no extension, no path) based on document content. "
+            f"The filename should be LONG and INFORMATIVE, combining: document type + person/entity + "
+            f"vendor/provider + date/period. Minimum 30 characters, maximum 100 characters.\n"
+            f"   Good examples (long and descriptive):\n"
+            f'   - "Facture_Orange_Internet_Eric_Mars_2024"\n'
+            f'   - "Convention_Stage_Developpeur_Full_Stack_Loic_Fev_2025"\n'
+            f'   - "Releve_Bancaire_Compte_Conjoint_Famille_Juin_2024"\n'
+            f'   - "Bulletin_Salaire_Eric_Martin_Avril_2024"\n'
+            f'   - "Certificat_Scolarite_College_Saint_Exupery_Elisa_2024_2025"\n'
+            f'   - "Ordonnance_Amoxicilline_Dr_Dupont_Eric_Janvier_2025"\n'
+            f"   - Use underscores, not spaces\n"
+            f"   - Include the full date or period\n"
+            f"   - Include the vendor/provider name when present\n"
+            f"   - Minimum 30 characters, maximum 100 characters\n"
+            f"3. Provide a confidence score between 0.0 and 1.0.\n"
+            f"4. Provide a one-sentence reasoning for your choices.\n\n"
+            f"Return ONLY valid JSON with no markdown formatting, no code fences, no extra text:\n"
+            f"{{\n"
+            f'  "category": "20-Achats&Fournisseurs",\n'
+            f'  "suggested_filename": "Facture_Orange_Internet_Eric_Mars_2024",\n'
+            f'  "confidence": 0.95,\n'
+            f'  "reasoning": "The document is an Orange internet invoice matching the Achats&Fournisseurs category."\n'
+            f"}}"
+        )
+        return prompt
 
+    def _parse_category_only_response(self, raw_response: str) -> dict:
+        """
+        Parse the JSON response for category-only classification.
+
+        Args:
+            raw_response: Raw text response from Ollama.
+
+        Returns:
+            dict with 'category', 'suggested_filename', 'confidence', 'reasoning'.
+        """
+        json_str = self._extract_json(raw_response)
+        if not json_str:
+            return {
+                "success": False,
+                "error": "No JSON found in AI response",
+            }
+
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logger.warning("JSON parse error: %s. Raw: %s", e, raw_response[:200])
+            return {
+                "success": False,
+                "error": f"JSON parse error: {e}",
+            }
+
+        # Validate required fields
+        required_fields = ["category", "suggested_filename", "confidence"]
+        missing = [f for f in required_fields if f not in data]
+        if missing:
+            return {
+                "success": False,
+                "error": f"Missing required fields in AI response: {missing}",
+            }
+
+        # Validate confidence is a number
+        try:
+            confidence = float(data["confidence"])
+        except (ValueError, TypeError):
+            return {
+                "success": False,
+                "error": f"Invalid confidence value: {data['confidence']}",
+            }
+
+        if confidence < 0.0 or confidence > 1.0:
+            return {
+                "success": False,
+                "error": f"Confidence out of range (0.0-1.0): {confidence}",
+            }
+
+        return {
+            "success": True,
+            "category": str(data["category"]).strip(),
+            "suggested_filename": str(data["suggested_filename"]).strip(),
+            "confidence": confidence,
+            "reasoning": str(data.get("reasoning", "")).strip(),
+        }
+
+
+    # ── Ollama API call ─────────────────────────────────────────────────────
     def _call_ollama(self, prompt: str, max_tokens: int = 500) -> dict:
         """
         Make the API call to Ollama and return the raw response text.
