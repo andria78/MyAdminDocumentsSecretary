@@ -2790,6 +2790,21 @@ def scan_admin_folder(
                             category,
                             new_filename,
                         )
+
+                        # Safe deletion: delete original file after successful reroute
+                        try:
+                            os.remove(full_path)
+                            logger.info(
+                                "🗑️ Deleted original file after reroute: %s",
+                                full_path,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                "Failed to delete original file %s after reroute: %s",
+                                full_path,
+                                e,
+                            )
+
                         success_count += 1
                         all_results.append({
                             "source_file": filename,
