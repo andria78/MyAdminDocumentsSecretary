@@ -105,6 +105,12 @@ class OCREngine:
                 doc.close()
                 os.replace(temp_path, pdf_path)
                 logger.info("Saved searchable PDF (in-place): %s", pdf_path)
+                return {
+                    "success": True,
+                    "text": full_text.strip(),
+                    "page_count": page_count,
+                    "error": None,
+                }
             else:
                 doc.save(output_path, incremental=False, deflate=True)
                 logger.info("Saved searchable PDF: %s", output_path)
