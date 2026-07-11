@@ -2967,6 +2967,7 @@ def scan_admin_folder(
 def deduplicate_admin_folder(
     config: ConfigManager,
     simulate: bool = False,
+    report_dir: str = "",
 ) -> int:
     """
     Scan the entire administrative folder for duplicate PDF files by SHA-256
@@ -3103,6 +3104,60 @@ def deduplicate_admin_folder(
             deleted_count,
             skipped_count,
         )
+
+    # ── Generate Markdown report ─────────────────────────────────────────────
+    if report_dir:
+        report_path = os.path.join(report_dir, "deduplicate_report.md")
+        os.makedirs(report_dir, exist_ok=True)
+
+        # Check if this is a new file (first run)
+        is_new = not os.path.isfile(report_path)
+
+        with open(report_path, "a", encoding="utf-8") as f:
+            if is_new:
+                f.write("# Deduplication Report\n\n")
+                f.write(
+                    "This report accumulates deduplication results across all runs. "
+                    "Each run is separated by a horizontal rule.\n\n"
+                )
+
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write("\n\n")
+            f.write("─" * 80)
+            f.write("\n\n")
+            f.write(f"## Run: {now}\n\n")
+            f.write(f"Generated: {now}\n")
+            f.write(f"Mode: {'Simulation' if simulate else 'Live'}\n")
+            f.write(f"Total duplicate groups found: {len(duplicate_groups)}\n")
+            f.write(f"Total duplicate files (extra): {total_duplicates}\n")
+            if simulate:
+                f.write(f"Simulated deletions: {simulated_count}\n")
+            else:
+                f.write(f"Deleted original files: {deleted_count}\n")
+            f.write(f"Skipped groups (no clear SCN): {skipped_count}\n\n")
+
+            if any(True for _ in duplicate_groups):
+                f.write("### Deleted / Simulated Files\n\n")
+                f.write(
+                    "| # | Original File (deleted) | Kept File | Action |\n"
+                    "|---|------------------------|-----------|--------|\n"
+                )
+                row_num = 0
+                for cksum, paths in sorted(duplicate_groups.items()):
+                    scn_files = [p for p in paths if should_rename_file(os.path.basename(p), config)]
+                    non_scn_files = [p for p in paths if not should_rename_file(os.path.basename(p), config)]
+                    if scn_files and non_scn_files:
+                        for scn_path in scn_files:
+                            row_num += 1
+                            action = "Simulated" if simulate else "Deleted"
+                            f.write(
+                                f"| {row_num} "
+                                f"| `{scn_path}` "
+                                f"| `{', '.join(non_scn_files)}` "
+                                f"| {action} |\n"
+                            )
+
+        logger.info("📄 Deduplication report written to: %s", report_path)
 
     return deleted_count if not simulate else simulated_count
 
@@ -3441,6 +3496,8 @@ def main():
             "Remove duplicate PDFs by SHA-256 checksum\n"
             "  python pipeline.py --deduplicate --simulate             "
             "Preview duplicates without deleting\n"
+            "  python pipeline.py --deduplicate --report-dir logs/reports\n"
+            "Deduplicate with Markdown report\n"
         ),
     )
 
@@ -3663,11 +3720,15 @@ def main():
         if args.simulate:
             logger.info("⚙️  SIMULATION MODE — no files will be deleted")
 
+        if args.report_dir:
+            logger.info("📁 Reports will be written to: %s", args.report_dir)
+
         # Start timing
         with TimingContext(logger, "deduplicate operation"):
             processed = deduplicate_admin_folder(
                 config,
                 simulate=args.simulate,
+                report_dir=args.report_dir,
             )
 
         if processed == 0:
