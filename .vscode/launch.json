@@ -153,6 +153,42 @@
             ],
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Deduplicate",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--deduplicate"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Deduplicate (Simulate)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--deduplicate",
+                "--simulate"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python Pipeline: Deduplicate (Report)",
+            "type": "python",
+            "request": "launch",
+            "module": "pipeline",
+            "args": [
+                "--deduplicate",
+                "--report-dir",
+                "logs/reports"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ]
 }
